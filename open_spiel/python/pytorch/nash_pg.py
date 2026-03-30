@@ -307,21 +307,38 @@ class NashPGAgent:
     with torch.no_grad():
       next_value = self._network.get_value(next_obs).reshape(1, -1)
 
-      # GAE computation (from ppo.py:318-338)
+      # Determine the current player for the bootstrap state
+      next_players = np.array(
+          [ts.observations["current_player"] for ts in time_steps])
+
+      # GAE computation with zero-sum player correction.
+      # The shared network predicts value from the current player's
+      # perspective. When the player changes between consecutive steps,
+      # the opponent's value is the negative of the current player's
+      # value (zero-sum property), so we negate the bootstrap.
       advantages = torch.zeros_like(self.rewards, device=self._device)
       lastgaelam = 0
       for t in reversed(range(self._steps_per_batch)):
         if t == self._steps_per_batch - 1:
           nextvalues = next_value
+          next_acting = next_players
         else:
           nextvalues = self.values[t + 1]
+          next_acting = self._acting_players[t + 1]
+
+        # Sign correction: -1 when next player differs (zero-sum)
+        player_sign = torch.tensor(
+            [1.0 if self._acting_players[t][i] == next_acting[i] else -1.0
+             for i in range(self._num_envs)],
+            dtype=torch.float32, device=self._device)
+
         nextnonterminal = 1.0 - self.dones[t]
         delta = (self.rewards[t]
-                 + self._gamma * nextvalues * nextnonterminal
+                 + self._gamma * player_sign * nextvalues * nextnonterminal
                  - self.values[t])
         advantages[t] = lastgaelam = (
             delta + self._gamma * self._gae_lambda
-            * nextnonterminal * lastgaelam)
+            * nextnonterminal * player_sign * lastgaelam)
       returns = advantages + self.values
 
     # Flatten [steps_per_batch, num_envs] -> [batch_size]
