@@ -37,6 +37,7 @@ import torch
 from torch.utils.tensorboard import SummaryWriter
 
 from open_spiel.python import rl_environment
+from open_spiel.python.bots import lost_cities_committer
 from open_spiel.python.pytorch import nfsp
 
 # Must import to register the game with pyspiel
@@ -154,6 +155,44 @@ def eval_vs_random(env, agent, rng, num_games):
   return wins, total_return / num_games
 
 
+def eval_vs_committer(env, agent, rng, num_games):
+  """Evaluate the NFSP agent (player 0) vs CommitterBot (player 1)."""
+  committer = lost_cities_committer.LostCitiesCommitterBot(1, rng)
+  wins = 0
+  total_return = 0.0
+
+  for _ in range(num_games):
+    state = env.game.new_initial_state()
+    committer.restart_at(state)
+    while not state.is_terminal():
+      if state.is_chance_node():
+        outcomes = state.chance_outcomes()
+        action_list, prob_list = zip(*outcomes)
+        action = rng.choice(action_list, p=prob_list)
+      elif state.current_player() == 0:
+        obs = {
+            "info_state": [None, None],
+            "legal_actions": [None, None],
+            "current_player": 0,
+        }
+        obs["info_state"][0] = state.information_state_tensor(0)
+        obs["legal_actions"][0] = state.legal_actions(0)
+        ts = rl_environment.TimeStep(
+            observations=obs, rewards=None, discounts=None, step_type=None)
+        with agent.temp_mode_as(nfsp.MODE.AVERAGE_POLICY):
+          action = agent.step(ts, is_evaluation=True).action
+      else:
+        action = committer.step(state)
+      state.apply_action(action)
+
+    returns = state.returns()
+    total_return += returns[0]
+    if returns[0] > 0:
+      wins += 1
+
+  return wins, total_return / num_games
+
+
 def main(unused_argv):
   env = rl_environment.Environment("python_lost_cities")
   info_state_size = env.observation_spec()["info_state"][0]
@@ -215,15 +254,24 @@ def main(unused_argv):
 
       writer.add_scalar("eval/win_rate_vs_random", win_rate, ep + 1)
       writer.add_scalar("eval/avg_score_vs_random", avg_score, ep + 1)
+
+      # Evaluate vs committer
+      c_wins, c_avg_score = eval_vs_committer(
+          env, agents[0], eval_rng, FLAGS.eval_games)
+      c_win_rate = c_wins / FLAGS.eval_games
+      writer.add_scalar("eval/win_rate_vs_committer", c_win_rate, ep + 1)
+      writer.add_scalar("eval/avg_score_vs_committer", c_avg_score, ep + 1)
+
       writer.add_scalar("perf/episodes_per_sec", eps_per_sec, ep + 1)
 
       remaining_eps = FLAGS.num_train_episodes - (ep + 1)
       eta_hours = (remaining_eps / eps_per_sec) / 3600 if eps_per_sec > 0 else 0
 
       logging.info(
-          "Episode %d | win_rate=%.2f avg_score=%.1f | "
+          "Episode %d | vs_rand=%.2f/%.1f vs_commit=%.2f/%.1f | "
           "%.1f ep/s | ETA %.1fh",
-          ep + 1, win_rate, avg_score, eps_per_sec, eta_hours)
+          ep + 1, win_rate, avg_score, c_win_rate, c_avg_score,
+          eps_per_sec, eta_hours)
 
     # Save checkpoints periodically
     if (ep + 1) % FLAGS.checkpoint_every == 0:
@@ -250,12 +298,20 @@ def main(unused_argv):
   save_checkpoint(agents, FLAGS.checkpoint_dir, FLAGS.num_train_episodes)
 
   wins, avg_score = eval_vs_random(env, agents[0], eval_rng, FLAGS.eval_games)
-  logging.info("Final: %d/%d wins vs random, avg score %.1f",
-               wins, FLAGS.eval_games, avg_score)
+  c_wins, c_avg_score = eval_vs_committer(
+      env, agents[0], eval_rng, FLAGS.eval_games)
+  logging.info("Final: %d/%d wins vs random (avg %.1f), "
+               "%d/%d wins vs committer (avg %.1f)",
+               wins, FLAGS.eval_games, avg_score,
+               c_wins, FLAGS.eval_games, c_avg_score)
   writer.add_scalar("eval/win_rate_vs_random",
                      wins / FLAGS.eval_games, FLAGS.num_train_episodes)
   writer.add_scalar("eval/avg_score_vs_random",
                      avg_score, FLAGS.num_train_episodes)
+  writer.add_scalar("eval/win_rate_vs_committer",
+                     c_wins / FLAGS.eval_games, FLAGS.num_train_episodes)
+  writer.add_scalar("eval/avg_score_vs_committer",
+                     c_avg_score, FLAGS.num_train_episodes)
 
   writer.close()
   total_time = time.time() - t_start
