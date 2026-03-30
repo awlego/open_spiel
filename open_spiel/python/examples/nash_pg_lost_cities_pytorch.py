@@ -46,7 +46,7 @@ from open_spiel.python.vector_env import SyncVectorEnv
 
 FLAGS = flags.FLAGS
 
-flags.DEFINE_integer("num_envs", 16,
+flags.DEFINE_integer("num_envs", 64,
                      "Number of parallel environments.")
 flags.DEFINE_integer("num_steps", 128,
                      "Number of steps per rollout before learning.")

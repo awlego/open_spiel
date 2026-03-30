@@ -212,6 +212,12 @@ class NashPGAgent:
     self._acting_players = np.zeros(
         (steps_per_batch, num_envs), dtype=np.int32)
 
+    # Pre-allocated scratch buffers for step() to avoid per-call allocation
+    self._step_obs_np = np.zeros(
+        (num_envs, info_state_size), dtype=np.float32)
+    self._step_mask = torch.zeros(
+        (num_envs, num_actions), dtype=torch.bool, device=self._device)
+
     self.cur_batch_idx = 0
     self.total_steps_done = 0
     self.updates_done = 0
@@ -236,18 +242,17 @@ class NashPGAgent:
       List of rl_agent.StepOutput(action, probs), one per environment.
     """
     # Extract observations and legal actions for the acting player in each env
+    # Uses pre-allocated buffers to avoid per-call allocation overhead
     players = []
-    obs_list = []
-    legal_list = []
-    for ts in time_steps:
+    self._step_mask.zero_()
+    for i, ts in enumerate(time_steps):
       pid = ts.observations["current_player"]
       players.append(pid)
-      obs_list.append(ts.observations["info_state"][pid])
-      legal_list.append(ts.observations["legal_actions"][pid])
+      self._step_obs_np[i] = ts.observations["info_state"][pid]
+      self._step_mask[i, ts.observations["legal_actions"][pid]] = True
 
-    obs = torch.tensor(
-        np.array(obs_list), dtype=torch.float32, device=self._device)
-    mask = legal_actions_to_mask(legal_list, self._num_actions).to(self._device)
+    obs = torch.as_tensor(self._step_obs_np, device=self._device)
+    mask = self._step_mask
 
     with torch.no_grad():
       action, logprob, _, value, probs = self._network.get_action_and_value(
