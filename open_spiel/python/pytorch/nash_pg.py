@@ -26,11 +26,14 @@ Algorithm (from arXiv:2510.18183, Yu et al., 2025):
   Inner loop: PPO-style policy gradient updates with KL or L2 regularization
     toward the magnetic reference policy.
 
+This implementation uses vectorized environments and a single shared agent
+(one network plays both sides). The observation tensor encodes player
+perspective, so no player_id is needed.
+
 Usage:
   See open_spiel/python/examples/nash_pg_lost_cities_pytorch.py for an example.
 """
 
-import collections
 import copy
 import os
 
@@ -44,12 +47,9 @@ import torch.nn.functional as F
 from open_spiel.python import rl_agent
 from open_spiel.python.pytorch.ppo import CategoricalMasked
 from open_spiel.python.pytorch.ppo import layer_init
+from open_spiel.python.pytorch.ppo import legal_actions_to_mask
 
 INVALID_ACTION_PENALTY = -1e6
-
-Transition = collections.namedtuple(
-    "Transition",
-    "info_state action log_prob reward discount value legal_actions_mask")
 
 
 class NashPGNetwork(nn.Module):
@@ -106,18 +106,22 @@ class NashPGNetwork(nn.Module):
     return action, dist.log_prob(action), dist.entropy(), self.critic(x), dist.probs
 
 
-class NashPGAgent(rl_agent.AbstractAgent):
-  """NashPG Agent implementation in PyTorch.
+class NashPGAgent:
+  """NashPG Agent with vectorized environment support.
+
+  Uses a single shared network for both players (the observation tensor
+  encodes player perspective). Collects data using step-based buffers
+  across multiple parallel environments.
 
   See open_spiel/python/examples/nash_pg_lost_cities_pytorch.py for usage.
   """
 
   def __init__(self,
-               player_id,
                info_state_size,
                num_actions,
+               num_envs,
+               steps_per_batch,
                hidden_layers_sizes=(128, 128),
-               batch_size=1024,
                learning_rate=3e-4,
                entropy_cost=0.05,
                magnetic_cost=0.2,
@@ -134,12 +138,12 @@ class NashPGAgent(rl_agent.AbstractAgent):
     """Initialize the NashPG agent.
 
     Args:
-      player_id: int, player identifier (position in the game).
       info_state_size: int, info_state vector size.
       num_actions: int, number of distinct actions.
+      num_envs: int, number of parallel environments.
+      steps_per_batch: int, number of steps per rollout before learning.
       hidden_layers_sizes: iterable of ints, hidden layer sizes for actor and
         critic networks.
-      batch_size: int, minimum number of transitions before learning.
       learning_rate: float, learning rate for Adam optimizer.
       entropy_cost: float, entropy bonus coefficient.
       magnetic_cost: float, coefficient for KL/L2 regularization toward the
@@ -156,10 +160,10 @@ class NashPGAgent(rl_agent.AbstractAgent):
       max_grad_norm: float, gradient clipping norm.
       device: str, torch device.
     """
-    self.player_id = player_id
     self._info_state_size = info_state_size
     self._num_actions = num_actions
-    self._batch_size = batch_size
+    self._num_envs = num_envs
+    self._steps_per_batch = steps_per_batch
     self._entropy_cost = entropy_cost
     self._magnetic_cost = magnetic_cost
     self._magnetic_divergence = magnetic_divergence
@@ -173,6 +177,9 @@ class NashPGAgent(rl_agent.AbstractAgent):
     self._max_grad_norm = max_grad_norm
     self._device = torch.device(device)
 
+    self._batch_size = num_envs * steps_per_batch
+    self._minibatch_size = max(1, self._batch_size // num_minibatches)
+
     # Networks
     self._network = NashPGNetwork(
         info_state_size, num_actions, hidden_layers_sizes).to(self._device)
@@ -184,18 +191,32 @@ class NashPGAgent(rl_agent.AbstractAgent):
     self._optimizer = optim.Adam(
         self._network.parameters(), lr=learning_rate, eps=1e-5)
 
-    # Episode data collection
-    self._episode_data = []
-    self._dataset = collections.defaultdict(list)
-    self._prev_time_step = None
-    self._prev_action = None
-    self._prev_log_prob = None
-    self._prev_value = None
+    # Pre-allocated rollout buffers [steps_per_batch, num_envs, ...]
+    self.obs = torch.zeros(
+        (steps_per_batch, num_envs, info_state_size), device=self._device)
+    self.actions = torch.zeros(
+        (steps_per_batch, num_envs), dtype=torch.long, device=self._device)
+    self.logprobs = torch.zeros(
+        (steps_per_batch, num_envs), device=self._device)
+    self.rewards = torch.zeros(
+        (steps_per_batch, num_envs), device=self._device)
+    self.dones = torch.zeros(
+        (steps_per_batch, num_envs), device=self._device)
+    self.values = torch.zeros(
+        (steps_per_batch, num_envs), device=self._device)
+    self.legal_actions_mask = torch.zeros(
+        (steps_per_batch, num_envs, num_actions),
+        dtype=torch.bool, device=self._device)
 
-    # Counters and loss tracking
-    self._step_counter = 0
-    self._episode_counter = 0
-    self._num_learn_steps = 0
+    # Track which player acted at each step (for correct reward indexing)
+    self._acting_players = np.zeros(
+        (steps_per_batch, num_envs), dtype=np.int32)
+
+    self.cur_batch_idx = 0
+    self.total_steps_done = 0
+    self.updates_done = 0
+
+    # Loss tracking
     self._last_pg_loss = None
     self._last_v_loss = None
     self._last_mag_loss = None
@@ -204,174 +225,134 @@ class NashPGAgent(rl_agent.AbstractAgent):
   def loss(self):
     return (self._last_pg_loss, self._last_v_loss, self._last_mag_loss)
 
-  def step(self, time_step, is_evaluation=False):
-    """Returns the action to be taken and updates the network if needed.
+  def step(self, time_steps, is_evaluation=False):
+    """Select actions for a batch of environments.
 
     Args:
-      time_step: an instance of rl_environment.TimeStep.
-      is_evaluation: bool, whether this is a training or evaluation call.
+      time_steps: list of TimeStep objects, one per environment.
+      is_evaluation: bool, if True, don't store data in buffers.
 
     Returns:
-      A `rl_agent.StepOutput` containing the action probs and chosen action.
+      List of rl_agent.StepOutput(action, probs), one per environment.
     """
-    if (not time_step.last()) and (
-        time_step.is_simultaneous_move() or
-        self.player_id == time_step.current_player()):
-      info_state = time_step.observations["info_state"][self.player_id]
-      legal_actions = time_step.observations["legal_actions"][self.player_id]
-      action, probs = self._act(info_state, legal_actions)
-    else:
-      action = None
-      probs = []
+    # Extract observations and legal actions for the acting player in each env
+    players = []
+    obs_list = []
+    legal_list = []
+    for ts in time_steps:
+      pid = ts.observations["current_player"]
+      players.append(pid)
+      obs_list.append(ts.observations["info_state"][pid])
+      legal_list.append(ts.observations["legal_actions"][pid])
 
-    if not is_evaluation:
-      self._step_counter += 1
-
-      if self._prev_time_step:
-        self._add_transition(time_step)
-
-      if time_step.last():
-        self._add_episode_data_to_dataset()
-        self._episode_counter += 1
-
-        if len(self._dataset["returns"]) >= self._batch_size:
-          self._learn()
-          self._num_learn_steps += 1
-          self._dataset = collections.defaultdict(list)
-
-        self._prev_time_step = None
-        self._prev_action = None
-        self._prev_log_prob = None
-        self._prev_value = None
-        return
-      else:
-        self._prev_time_step = time_step
-        self._prev_action = action
-
-    return rl_agent.StepOutput(action=action, probs=probs)
-
-  def _act(self, info_state, legal_actions):
-    """Sample an action from the policy network.
-
-    Args:
-      info_state: numpy array of the info state.
-      legal_actions: list of legal action IDs.
-
-    Returns:
-      (action_int, probs_numpy) tuple.
-    """
-    info_state_t = torch.FloatTensor(
-        np.reshape(info_state, [1, -1])).to(self._device)
-    legal_actions_mask = torch.zeros(
-        1, self._num_actions, dtype=torch.bool, device=self._device)
-    legal_actions_mask[0, legal_actions] = True
+    obs = torch.tensor(
+        np.array(obs_list), dtype=torch.float32, device=self._device)
+    mask = legal_actions_to_mask(legal_list, self._num_actions).to(self._device)
 
     with torch.no_grad():
-      action, log_prob, _, value, probs = self._network.get_action_and_value(
-          info_state_t, legal_actions_mask)
+      action, logprob, _, value, probs = self._network.get_action_and_value(
+          obs, mask)
 
-    self._prev_log_prob = log_prob.item()
-    self._prev_value = value.item()
+    if not is_evaluation:
+      self.obs[self.cur_batch_idx] = obs
+      self.legal_actions_mask[self.cur_batch_idx] = mask
+      self.actions[self.cur_batch_idx] = action
+      self.logprobs[self.cur_batch_idx] = logprob
+      self.values[self.cur_batch_idx] = value.flatten()
+      self._acting_players[self.cur_batch_idx] = players
 
-    action_int = action.item()
-    probs_np = probs[0].cpu().numpy()
-    return action_int, probs_np
+    return [
+        rl_agent.StepOutput(action=a.item(), probs=p)
+        for a, p in zip(action, probs)
+    ]
 
-  def _add_transition(self, time_step):
-    """Add a transition from self._prev_time_step to time_step."""
-    legal_actions = (
-        self._prev_time_step.observations["legal_actions"][self.player_id])
-    legal_actions_mask = np.zeros(self._num_actions)
-    legal_actions_mask[legal_actions] = 1.0
+  def post_step(self, rewards, dones):
+    """Record rewards and dones after environment step.
 
-    transition = Transition(
-        info_state=(
-            self._prev_time_step.observations["info_state"][
-                self.player_id][:]),
-        action=self._prev_action,
-        log_prob=self._prev_log_prob,
-        reward=time_step.rewards[self.player_id],
-        discount=time_step.discounts[self.player_id],
-        value=self._prev_value,
-        legal_actions_mask=legal_actions_mask)
-    self._episode_data.append(transition)
+    Args:
+      rewards: list of reward lists, shape [num_envs][num_players].
+      dones: list of bools, shape [num_envs].
+    """
+    # Extract reward for the player who acted at this step
+    acting = self._acting_players[self.cur_batch_idx]
+    r = torch.tensor(
+        [rewards[i][acting[i]] for i in range(self._num_envs)],
+        dtype=torch.float32, device=self._device)
+    self.rewards[self.cur_batch_idx] = r
+    self.dones[self.cur_batch_idx] = torch.tensor(
+        dones, dtype=torch.float32, device=self._device)
 
-  def _add_episode_data_to_dataset(self):
-    """Compute GAE and add episode data to the dataset buffer."""
-    if not self._episode_data:
-      return
+    self.total_steps_done += self._num_envs
+    self.cur_batch_idx += 1
 
-    info_states = [t.info_state for t in self._episode_data]
-    actions = [t.action for t in self._episode_data]
-    log_probs = [t.log_prob for t in self._episode_data]
-    rewards = np.array([t.reward for t in self._episode_data])
-    values = np.array([t.value for t in self._episode_data])
-    legal_actions_masks = [t.legal_actions_mask for t in self._episode_data]
+  def learn(self, time_steps):
+    """Compute GAE, flatten buffers, and run PPO + magnetic updates.
 
-    # GAE computation (bootstrap value = 0 at terminal)
-    n = len(self._episode_data)
-    advantages = np.zeros(n)
-    lastgaelam = 0.0
-    for t in reversed(range(n)):
-      if t == n - 1:
-        next_value = 0.0  # terminal
-      else:
-        next_value = values[t + 1]
-      delta = rewards[t] + self._gamma * next_value - values[t]
-      advantages[t] = lastgaelam = (
-          delta + self._gamma * self._gae_lambda * lastgaelam)
-    returns = advantages + values
+    Args:
+      time_steps: list of current TimeStep objects (for bootstrapping).
+    """
+    # Bootstrap value from the next observation
+    obs_list = []
+    for ts in time_steps:
+      pid = ts.observations["current_player"]
+      obs_list.append(ts.observations["info_state"][pid])
+    next_obs = torch.tensor(
+        np.array(obs_list), dtype=torch.float32, device=self._device)
 
-    self._dataset["info_states"].extend(info_states)
-    self._dataset["actions"].extend(actions)
-    self._dataset["log_probs"].extend(log_probs)
-    self._dataset["advantages"].extend(advantages.tolist())
-    self._dataset["returns"].extend(returns.tolist())
-    self._dataset["values"].extend(values.tolist())
-    self._dataset["legal_actions_masks"].extend(legal_actions_masks)
-    self._episode_data = []
+    with torch.no_grad():
+      next_value = self._network.get_value(next_obs).reshape(1, -1)
 
-  def _learn(self):
-    """PPO update with magnetic regularization."""
-    b_info_states = torch.FloatTensor(
-        np.array(self._dataset["info_states"])).to(self._device)
-    b_actions = torch.LongTensor(self._dataset["actions"]).to(self._device)
-    b_log_probs = torch.FloatTensor(
-        self._dataset["log_probs"]).to(self._device)
-    b_advantages = torch.FloatTensor(
-        self._dataset["advantages"]).to(self._device)
-    b_returns = torch.FloatTensor(self._dataset["returns"]).to(self._device)
-    b_values = torch.FloatTensor(self._dataset["values"]).to(self._device)
-    b_legal_masks = torch.BoolTensor(
-        np.array(self._dataset["legal_actions_masks"])).to(self._device)
+      # GAE computation (from ppo.py:318-338)
+      advantages = torch.zeros_like(self.rewards, device=self._device)
+      lastgaelam = 0
+      for t in reversed(range(self._steps_per_batch)):
+        if t == self._steps_per_batch - 1:
+          nextvalues = next_value
+        else:
+          nextvalues = self.values[t + 1]
+        nextnonterminal = 1.0 - self.dones[t]
+        delta = (self.rewards[t]
+                 + self._gamma * nextvalues * nextnonterminal
+                 - self.values[t])
+        advantages[t] = lastgaelam = (
+            delta + self._gamma * self._gae_lambda
+            * nextnonterminal * lastgaelam)
+      returns = advantages + self.values
 
-    batch_size = len(self._dataset["returns"])
-    minibatch_size = max(1, batch_size // self._num_minibatches)
-    b_inds = np.arange(batch_size)
+    # Flatten [steps_per_batch, num_envs] -> [batch_size]
+    b_obs = self.obs.reshape(-1, self._info_state_size)
+    b_logprobs = self.logprobs.reshape(-1)
+    b_actions = self.actions.reshape(-1)
+    b_advantages = advantages.reshape(-1)
+    b_returns = returns.reshape(-1)
+    b_values = self.values.reshape(-1)
+    b_legal_masks = self.legal_actions_mask.reshape(-1, self._num_actions)
 
     # Get magnetic policy log-probs (frozen, no grad)
     with torch.no_grad():
-      mag_logits = self._magnetic_network.get_policy_logits(b_info_states)
+      mag_logits = self._magnetic_network.get_policy_logits(b_obs)
       mag_logits = torch.where(
           b_legal_masks, mag_logits,
           torch.tensor(INVALID_ACTION_PENALTY, device=self._device))
       mag_log_probs = F.log_softmax(mag_logits, dim=-1)
       mag_probs = F.softmax(mag_logits, dim=-1)
 
+    b_inds = np.arange(self._batch_size)
+
     for _ in range(self._update_epochs):
       np.random.shuffle(b_inds)
-      for start in range(0, batch_size, minibatch_size):
-        end = start + minibatch_size
+      for start in range(0, self._batch_size, self._minibatch_size):
+        end = start + self._minibatch_size
         mb = b_inds[start:end]
 
         _, new_log_prob, entropy, new_value, new_probs = (
             self._network.get_action_and_value(
-                b_info_states[mb],
+                b_obs[mb],
                 legal_actions_mask=b_legal_masks[mb],
                 action=b_actions[mb]))
 
         # Importance sampling ratio
-        log_ratio = new_log_prob - b_log_probs[mb]
+        log_ratio = new_log_prob - b_logprobs[mb]
         ratio = log_ratio.exp()
 
         # Normalize advantages
@@ -433,31 +414,34 @@ class NashPGAgent(rl_agent.AbstractAgent):
     self._last_v_loss = v_loss.item()
     self._last_mag_loss = mag_loss.item()
 
+    # Reset for next rollout
+    self.cur_batch_idx = 0
+    self.updates_done += 1
+
   def update_magnetic_reference(self):
     """Update the magnetic reference policy by cloning the current network."""
     self._magnetic_network.load_state_dict(self._network.state_dict())
     self._magnetic_network.eval()
     for p in self._magnetic_network.parameters():
       p.requires_grad = False
-    logging.info("Player %d: updated magnetic reference policy.", self.player_id)
+    logging.info("Updated magnetic reference policy.")
 
   def save(self, checkpoint_dir):
     """Save agent state to checkpoint directory."""
-    path = os.path.join(checkpoint_dir, f"nash_pg_pid{self.player_id}.pt")
+    path = os.path.join(checkpoint_dir, "nash_pg.pt")
     data = {
         "network": self._network.state_dict(),
         "magnetic_network": self._magnetic_network.state_dict(),
         "optimizer": self._optimizer.state_dict(),
-        "step_counter": self._step_counter,
-        "episode_counter": self._episode_counter,
-        "num_learn_steps": self._num_learn_steps,
+        "total_steps_done": self.total_steps_done,
+        "updates_done": self.updates_done,
     }
     torch.save(data, path)
     logging.info("Saved to %s", path)
 
   def restore(self, checkpoint_dir):
     """Restore agent state from checkpoint directory."""
-    path = os.path.join(checkpoint_dir, f"nash_pg_pid{self.player_id}.pt")
+    path = os.path.join(checkpoint_dir, "nash_pg.pt")
     data = torch.load(path, weights_only=True)
     self._network.load_state_dict(data["network"])
     self._magnetic_network.load_state_dict(data["magnetic_network"])
@@ -465,7 +449,6 @@ class NashPGAgent(rl_agent.AbstractAgent):
     for p in self._magnetic_network.parameters():
       p.requires_grad = False
     self._optimizer.load_state_dict(data["optimizer"])
-    self._step_counter = data["step_counter"]
-    self._episode_counter = data["episode_counter"]
-    self._num_learn_steps = data["num_learn_steps"]
+    self.total_steps_done = data["total_steps_done"]
+    self.updates_done = data["updates_done"]
     logging.info("Restored from %s", path)

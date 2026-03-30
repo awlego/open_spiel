@@ -20,87 +20,93 @@ import torch
 
 from open_spiel.python import rl_environment
 from open_spiel.python.pytorch import nash_pg
+from open_spiel.python.vector_env import SyncVectorEnv
 
 
 class NashPGTest(unittest.TestCase):
 
   def test_run_kuhn_poker(self):
-    """Smoke test: run NashPG self-play on Kuhn Poker for a few episodes."""
-    env = rl_environment.Environment("kuhn_poker")
-    info_state_size = env.observation_spec()["info_state"][0]
-    num_actions = env.action_spec()["num_actions"]
+    """Smoke test: run NashPG self-play on Kuhn Poker with vectorized envs."""
+    num_envs = 4
+    num_steps = 32
+    envs = SyncVectorEnv([
+        rl_environment.Environment("kuhn_poker")
+        for _ in range(num_envs)
+    ])
+    info_state_size = envs.observation_spec()["info_state"][0]
+    num_actions = envs.envs[0].action_spec()["num_actions"]
 
-    agents = [
-        nash_pg.NashPGAgent(
-            player_id=i,
-            info_state_size=info_state_size,
-            num_actions=num_actions,
-            hidden_layers_sizes=(32, 32),
-            batch_size=32,
-            update_epochs=2,
-            num_minibatches=2,
-        )
-        for i in range(2)
-    ]
+    agent = nash_pg.NashPGAgent(
+        info_state_size=info_state_size,
+        num_actions=num_actions,
+        num_envs=num_envs,
+        steps_per_batch=num_steps,
+        hidden_layers_sizes=(32, 32),
+        update_epochs=2,
+        num_minibatches=2,
+    )
 
-    for ep in range(50):
-      time_step = env.reset()
-      while not time_step.last():
-        pid = time_step.observations["current_player"]
-        agent_output = agents[pid].step(time_step)
-        time_step = env.step([agent_output.action])
-      for agent in agents:
-        agent.step(time_step)
+    time_steps = envs.reset()
+    for update in range(5):
+      for _ in range(num_steps):
+        agent_output = agent.step(time_steps)
+        time_steps, rewards, dones, _ = envs.step(
+            agent_output, reset_if_done=True)
+        agent.post_step(rewards, dones)
+      agent.learn(time_steps)
 
       # Update magnetic reference halfway through
-      if ep == 25:
-        for agent in agents:
-          agent.update_magnetic_reference()
+      if update == 2:
+        agent.update_magnetic_reference()
 
-    # Verify losses are finite (agents should have learned at least once)
-    for agent in agents:
-      pg_loss, v_loss, mag_loss = agent.loss
-      if pg_loss is not None:
-        self.assertTrue(np.isfinite(pg_loss), f"pg_loss not finite: {pg_loss}")
-        self.assertTrue(np.isfinite(v_loss), f"v_loss not finite: {v_loss}")
-        self.assertTrue(np.isfinite(mag_loss),
-                        f"mag_loss not finite: {mag_loss}")
+    # Verify losses are finite
+    pg_loss, v_loss, mag_loss = agent.loss
+    self.assertIsNotNone(pg_loss)
+    self.assertTrue(np.isfinite(pg_loss), f"pg_loss not finite: {pg_loss}")
+    self.assertTrue(np.isfinite(v_loss), f"v_loss not finite: {v_loss}")
+    self.assertTrue(np.isfinite(mag_loss), f"mag_loss not finite: {mag_loss}")
 
   def test_run_kuhn_poker_l2_divergence(self):
     """Test with L2 divergence instead of KL."""
-    env = rl_environment.Environment("kuhn_poker")
-    info_state_size = env.observation_spec()["info_state"][0]
-    num_actions = env.action_spec()["num_actions"]
+    num_envs = 4
+    num_steps = 32
+    envs = SyncVectorEnv([
+        rl_environment.Environment("kuhn_poker")
+        for _ in range(num_envs)
+    ])
+    info_state_size = envs.observation_spec()["info_state"][0]
+    num_actions = envs.envs[0].action_spec()["num_actions"]
 
-    agents = [
-        nash_pg.NashPGAgent(
-            player_id=i,
-            info_state_size=info_state_size,
-            num_actions=num_actions,
-            hidden_layers_sizes=(32, 32),
-            batch_size=32,
-            magnetic_divergence="l2",
-        )
-        for i in range(2)
-    ]
+    agent = nash_pg.NashPGAgent(
+        info_state_size=info_state_size,
+        num_actions=num_actions,
+        num_envs=num_envs,
+        steps_per_batch=num_steps,
+        hidden_layers_sizes=(32, 32),
+        magnetic_divergence="l2",
+    )
 
-    for _ in range(50):
-      time_step = env.reset()
-      while not time_step.last():
-        pid = time_step.observations["current_player"]
-        agent_output = agents[pid].step(time_step)
-        time_step = env.step([agent_output.action])
-      for agent in agents:
-        agent.step(time_step)
+    time_steps = envs.reset()
+    for _ in range(3):
+      for _ in range(num_steps):
+        agent_output = agent.step(time_steps)
+        time_steps, rewards, dones, _ = envs.step(
+            agent_output, reset_if_done=True)
+        agent.post_step(rewards, dones)
+      agent.learn(time_steps)
+
+    pg_loss, v_loss, mag_loss = agent.loss
+    self.assertIsNotNone(pg_loss)
+    self.assertTrue(np.isfinite(pg_loss))
 
   def test_magnetic_update_copies_weights(self):
     """After update_magnetic_reference, magnetic net should match current."""
     agent = nash_pg.NashPGAgent(
-        player_id=0,
         info_state_size=11,
         num_actions=2,
+        num_envs=2,
+        steps_per_batch=8,
         hidden_layers_sizes=(16,),
-        batch_size=16,
     )
 
     # Manually perturb the network weights so they differ from magnetic
@@ -133,36 +139,34 @@ class NashPGTest(unittest.TestCase):
 
   def test_eval_mode_no_learning(self):
     """Evaluation mode should produce actions without updating weights."""
-    env = rl_environment.Environment("kuhn_poker")
-    info_state_size = env.observation_spec()["info_state"][0]
-    num_actions = env.action_spec()["num_actions"]
+    num_envs = 2
+    envs = SyncVectorEnv([
+        rl_environment.Environment("kuhn_poker")
+        for _ in range(num_envs)
+    ])
+    info_state_size = envs.observation_spec()["info_state"][0]
+    num_actions = envs.envs[0].action_spec()["num_actions"]
 
     agent = nash_pg.NashPGAgent(
-        player_id=0,
         info_state_size=info_state_size,
         num_actions=num_actions,
+        num_envs=num_envs,
+        steps_per_batch=8,
         hidden_layers_sizes=(16,),
-        batch_size=16,
     )
 
     # Get initial weights
     initial_weights = {k: v.clone()
                        for k, v in agent._network.state_dict().items()}
 
-    # Run evaluation episodes
-    for _ in range(10):
-      time_step = env.reset()
-      while not time_step.last():
-        pid = time_step.observations["current_player"]
-        if pid == 0:
-          output = agent.step(time_step, is_evaluation=True)
-          self.assertIsNotNone(output)
-          self.assertIsNotNone(output.action)
-          action = output.action
-        else:
-          legal = time_step.observations["legal_actions"][pid]
-          action = np.random.choice(legal)
-        time_step = env.step([action])
+    # Run evaluation steps
+    time_steps = envs.reset()
+    for _ in range(20):
+      outputs = agent.step(time_steps, is_evaluation=True)
+      for out in outputs:
+        self.assertIsNotNone(out)
+        self.assertIsNotNone(out.action)
+      time_steps, _, _, _ = envs.step(outputs, reset_if_done=True)
 
     # Weights should not have changed
     for k, v in agent._network.state_dict().items():
