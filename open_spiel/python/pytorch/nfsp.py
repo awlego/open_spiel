@@ -280,7 +280,7 @@ class NFSP(rl_agent.AbstractAgent):
     """
     if self._mode == MODE.BEST_RESPONSE:
       agent_output = self._rl_agent.step(time_step, is_evaluation)
-      if not is_evaluation and not time_step.last():
+      if not is_evaluation and not time_step.last() and agent_output is not None:
         self.add_transition(time_step, agent_output)
 
     elif self._mode == MODE.AVERAGE_POLICY:
@@ -324,7 +324,7 @@ class NFSP(rl_agent.AbstractAgent):
         return
       else:
         self._prev_timestep = time_step
-        self._prev_action = agent_output.action
+        self._prev_action = agent_output.action if agent_output else None
     return agent_output
 
   def add_transition(
