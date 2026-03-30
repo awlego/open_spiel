@@ -32,15 +32,13 @@ from open_spiel.python import rl_environment
 from open_spiel.python.pytorch import nash_pg
 from open_spiel.python.vector_env import SyncVectorEnv
 
-# Must import to register the game with pyspiel
-from open_spiel.python.games import lost_cities  # pylint: disable=unused-import
 
 FLAGS = flags.FLAGS
 
 flags.DEFINE_integer("num_envs", 16, "Number of parallel environments.")
 flags.DEFINE_integer("num_steps", 128, "Steps per rollout.")
 flags.DEFINE_integer("num_updates", 10, "Number of updates to profile.")
-flags.DEFINE_string("game", "python_lost_cities", "Game to profile.")
+flags.DEFINE_string("game", "lost_cities", "Game to profile.")
 
 
 def main(unused_argv):

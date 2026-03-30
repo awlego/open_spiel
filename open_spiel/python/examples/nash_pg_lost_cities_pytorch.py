@@ -43,8 +43,6 @@ from open_spiel.python.bots import lost_cities_committer
 from open_spiel.python.pytorch import nash_pg
 from open_spiel.python.vector_env import SyncVectorEnv
 
-# Must import to register the game with pyspiel
-from open_spiel.python.games import lost_cities  # pylint: disable=unused-import
 
 FLAGS = flags.FLAGS
 
@@ -191,7 +189,7 @@ def eval_vs_committer(game, agent, rng, num_games, device="cpu"):
 
 def main(unused_argv):
   envs = SyncVectorEnv([
-      rl_environment.Environment("python_lost_cities")
+      rl_environment.Environment("lost_cities")
       for _ in range(FLAGS.num_envs)
   ])
   info_state_size = envs.observation_spec()["info_state"][0]

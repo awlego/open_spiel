@@ -94,6 +94,8 @@ set(GAME_SOURCES
   gin_rummy/gin_rummy.h
   gin_rummy/gin_rummy_utils.cc
   gin_rummy/gin_rummy_utils.h
+  lost_cities/lost_cities.cc
+  lost_cities/lost_cities.h
   go/go.cc
   go/go.h
   go/go_board.cc
@@ -498,6 +500,10 @@ add_test(garnet_test garnet_test)
 add_executable(gin_rummy_test gin_rummy/gin_rummy_test.cc ${OPEN_SPIEL_OBJECTS}
                $<TARGET_OBJECTS:tests>)
 add_test(gin_rummy_test gin_rummy_test)
+
+add_executable(lost_cities_test lost_cities/lost_cities_test.cc ${OPEN_SPIEL_OBJECTS}
+               $<TARGET_OBJECTS:tests>)
+add_test(lost_cities_test lost_cities_test)
 
 add_executable(go_test go/go_test.cc ${OPEN_SPIEL_OBJECTS}
                $<TARGET_OBJECTS:tests>)
