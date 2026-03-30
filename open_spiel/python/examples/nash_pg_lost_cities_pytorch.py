@@ -57,8 +57,8 @@ flags.DEFINE_list("hidden_layers_sizes", [128, 128],
 flags.DEFINE_integer("batch_size", 1024,
                      "Minimum transitions before learning.")
 flags.DEFINE_float("learning_rate", 3e-4, "Learning rate for Adam optimizer.")
-flags.DEFINE_float("entropy_cost", 0.01, "Entropy bonus coefficient.")
-flags.DEFINE_float("magnetic_cost", 0.5,
+flags.DEFINE_float("entropy_cost", 0.05, "Entropy bonus coefficient.")
+flags.DEFINE_float("magnetic_cost", 0.2,
                    "Magnetic regularization coefficient.")
 flags.DEFINE_string("magnetic_divergence", "kl",
                     "Magnetic divergence type: 'kl' or 'l2'.")
