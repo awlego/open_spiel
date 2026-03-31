@@ -140,85 +140,130 @@ def load_checkpoint(agent, checkpoint_dir):
   return update, outer_step
 
 
-def eval_vs_random(game, agent, rng, num_games, device="cpu"):
-  """Evaluate the agent vs a random opponent, alternating player seats."""
-  wins = 0
-  total_return = 0.0
+def _advance_non_agent(state, agent_player, rng, committer=None):
+  """Advance a game state past chance nodes and opponent turns.
 
-  for game_num in range(num_games):
-    agent_player = game_num % 2
-    state = game.new_initial_state()
-    while not state.is_terminal():
-      if state.is_chance_node():
-        outcomes = state.chance_outcomes()
-        action_list, prob_list = zip(*outcomes)
-        action = rng.choice(action_list, p=prob_list)
-      elif state.current_player() == agent_player:
-        obs = {
-            "info_state": [None, None],
-            "legal_actions": [None, None],
-            "current_player": agent_player,
-        }
-        obs["info_state"][agent_player] = (
-            state.information_state_tensor(agent_player))
-        obs["legal_actions"][agent_player] = (
-            state.legal_actions(agent_player))
-        ts = rl_environment.TimeStep(
-            observations=obs, rewards=None, discounts=None, step_type=None)
-        action = agent.step([ts], is_evaluation=True)[0].action
+  Returns True if the state is still in progress (agent's turn next),
+  False if the game reached a terminal state.
+  """
+  while not state.is_terminal():
+    if state.is_chance_node():
+      outcomes = state.chance_outcomes()
+      action_list, prob_list = zip(*outcomes)
+      state.apply_action(rng.choice(action_list, p=prob_list))
+    elif state.current_player() != agent_player:
+      if committer is not None:
+        state.apply_action(committer.step(state))
       else:
         legal = state.legal_actions()
-        action = rng.choice(legal)
-      state.apply_action(action)
+        state.apply_action(rng.choice(legal))
+    else:
+      return True
+  return False
 
-    returns = state.returns()
-    total_return += returns[agent_player]
-    if returns[agent_player] > 0:
-      wins += 1
+
+def _run_vectorized_eval(game, agent, rng, num_games, batch_size=128,
+                         make_opponent=None):
+  """Run batched evaluation games.
+
+  Args:
+    game: pyspiel Game object.
+    agent: NashPGAgent with eval_step() method.
+    rng: numpy RandomState.
+    num_games: total games to play.
+    batch_size: max simultaneous games.
+    make_opponent: callable(player_id, rng) -> opponent bot, or None for random.
+
+  Returns:
+    (wins, avg_return) for the agent.
+  """
+  wins = 0
+  total_return = 0.0
+  games_completed = 0
+  next_game = 0
+
+  batch = min(batch_size, num_games)
+  states = [None] * batch
+  agent_players = [0] * batch
+  opponents = [None] * batch
+
+  # Start initial batch of games
+  for i in range(batch):
+    agent_players[i] = next_game % 2
+    states[i] = game.new_initial_state()
+    if make_opponent is not None:
+      opponents[i] = make_opponent(1 - agent_players[i], rng)
+      opponents[i].restart_at(states[i])
+    _advance_non_agent(states[i], agent_players[i], rng, opponents[i])
+    next_game += 1
+
+  while games_completed < num_games:
+    # Collect indices where the agent needs to act (non-terminal states)
+    agent_indices = []
+    agent_ts = []
+    for i in range(batch):
+      if states[i] is None:
+        continue
+      if states[i].is_terminal():
+        # Record result and recycle slot
+        returns = states[i].returns()
+        total_return += returns[agent_players[i]]
+        if returns[agent_players[i]] > 0:
+          wins += 1
+        games_completed += 1
+
+        if next_game < num_games:
+          agent_players[i] = next_game % 2
+          states[i] = game.new_initial_state()
+          if make_opponent is not None:
+            opponents[i] = make_opponent(1 - agent_players[i], rng)
+            opponents[i].restart_at(states[i])
+          next_game += 1
+          # Advance past chance/opponent to agent's turn or terminal
+          _advance_non_agent(states[i], agent_players[i], rng, opponents[i])
+          # Re-check: might already be terminal after advancing
+          if states[i].is_terminal():
+            continue
+        else:
+          states[i] = None
+          continue
+
+      ap = agent_players[i]
+      obs = {
+          "info_state": [None, None],
+          "legal_actions": [None, None],
+          "current_player": ap,
+      }
+      obs["info_state"][ap] = states[i].information_state_tensor(ap)
+      obs["legal_actions"][ap] = states[i].legal_actions(ap)
+      agent_indices.append(i)
+      agent_ts.append(rl_environment.TimeStep(
+          observations=obs, rewards=None, discounts=None, step_type=None))
+
+    if not agent_ts:
+      continue
+
+    # Batched inference
+    actions = agent.eval_step(agent_ts)
+    for idx, action in zip(agent_indices, actions):
+      states[idx].apply_action(action)
+      # Advance past chance/opponent until agent's turn again or terminal
+      _advance_non_agent(states[idx], agent_players[idx], rng, opponents[idx])
 
   return wins, total_return / num_games
+
+
+def eval_vs_random(game, agent, rng, num_games, device="cpu"):
+  """Evaluate the agent vs a random opponent, alternating player seats."""
+  return _run_vectorized_eval(game, agent, rng, num_games)
 
 
 def eval_vs_committer(game, agent, rng, num_games, device="cpu"):
   """Evaluate the agent vs CommitterBot, alternating player seats."""
-  wins = 0
-  total_return = 0.0
-
-  for game_num in range(num_games):
-    agent_player = game_num % 2
-    committer_player = 1 - agent_player
-    committer = lost_cities_committer.LostCitiesCommitterBot(
-        committer_player, rng)
-    state = game.new_initial_state()
-    committer.restart_at(state)
-    while not state.is_terminal():
-      if state.is_chance_node():
-        outcomes = state.chance_outcomes()
-        action_list, prob_list = zip(*outcomes)
-        action = rng.choice(action_list, p=prob_list)
-      elif state.current_player() == agent_player:
-        obs = {
-            "info_state": [None, None],
-            "legal_actions": [None, None],
-            "current_player": agent_player,
-        }
-        obs["info_state"][agent_player] = (
-            state.information_state_tensor(agent_player))
-        obs["legal_actions"][agent_player] = (
-            state.legal_actions(agent_player))
-        ts = rl_environment.TimeStep(
-            observations=obs, rewards=None, discounts=None, step_type=None)
-        action = agent.step([ts], is_evaluation=True)[0].action
-      else:
-        action = committer.step(state)
-      state.apply_action(action)
-
-    returns = state.returns()
-    total_return += returns[agent_player]
-    if returns[agent_player] > 0:
-      wins += 1
-
-  return wins, total_return / num_games
+  def make_committer(player_id, rng):
+    return lost_cities_committer.LostCitiesCommitterBot(player_id, rng)
+  return _run_vectorized_eval(game, agent, rng, num_games,
+                              make_opponent=make_committer)
 
 
 def main(unused_argv):

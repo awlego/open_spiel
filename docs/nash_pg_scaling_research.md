@@ -107,8 +107,12 @@ tuned for one model size but wrong for another.
 - For each model size in Phase 1, run a 3-point LR sweep: 1e-4, 3e-4, 1e-3.
 - Train for 5M steps (~610 updates) per run, seed 42 only.
 - Select the LR with the highest avg_score_vs_committer at 5M steps.
+- Eval settings: 1000 games vs committer, 100 games vs random (sufficient
+  precision for LR ranking; SE ~1.6% at 50% win rate).
+- Eval frequency: eval only at end of run (`--eval_every=610`).
 - Total: 15 short runs (5 sizes × 3 LRs).
-- Wall-clock estimate: ~15-20 hours total (30-75 min per run).
+- Wall-clock estimate: ~1 hour at 3 parallel, ~3 hours sequential
+  (7-19 min per run).
 
 **Decision rule:**
 - If the same LR wins across all sizes → use it everywhere for Phase 1.
@@ -126,7 +130,8 @@ PYTHONPATH=.:build/python env3.12/bin/python \
   --hidden_layers_sizes=WIDTH,WIDTH \
   --learning_rate=LR \
   --total_updates=610 \
-  --eval_games=5000 \
+  --eval_every=610 \
+  --eval_games=1000 \
   --seed=42 \
   --checkpoint_dir=checkpoints/phase0_WIDTHx2_lrLR \
   --logdir=runs/phase0_WIDTHx2_lrLR
@@ -310,6 +315,12 @@ _To be filled in._
 
 3. **Log policy entropy to TensorBoard** — `agent.loss` now returns a
    4-tuple including raw entropy; logged as `loss/entropy`. _(commit `df65b695`)_
+
+4. **Vectorized evaluation** — `eval_vs_random()` and `eval_vs_committer()`
+   now run games in parallel batches (default 128 simultaneous games) with
+   batched agent inference via `NashPGAgent.eval_step()`. Measured 11-19×
+   speedup over sequential evaluation (1000 games, 256x2 model). Eval is
+   no longer the wall-clock bottleneck.
 
 ### Remaining
 

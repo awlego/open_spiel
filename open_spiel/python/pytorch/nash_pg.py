@@ -273,6 +273,32 @@ class NashPGAgent:
         for a, p in zip(action, probs)
     ]
 
+  def eval_step(self, time_steps):
+    """Select greedy actions for a variable-sized batch (eval only).
+
+    Unlike step(), this allocates fresh tensors so it works with any batch
+    size, not just num_envs.  Intended for vectorized evaluation loops.
+
+    Args:
+      time_steps: list of TimeStep objects (any length).
+
+    Returns:
+      List of chosen action ints, one per TimeStep.
+    """
+    n = len(time_steps)
+    obs_np = np.zeros((n, self._info_state_size), dtype=np.float32)
+    mask = torch.zeros(
+        (n, self._num_actions), dtype=torch.bool, device=self._device)
+    for i, ts in enumerate(time_steps):
+      pid = ts.observations["current_player"]
+      obs_np[i] = ts.observations["info_state"][pid]
+      mask[i, ts.observations["legal_actions"][pid]] = True
+
+    obs = torch.as_tensor(obs_np, device=self._device)
+    with torch.no_grad():
+      action, _, _, _, _ = self._network.get_action_and_value(obs, mask)
+    return [a.item() for a in action]
+
   def post_step(self, rewards, dones):
     """Record rewards and dones after environment step.
 
