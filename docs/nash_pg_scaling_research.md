@@ -150,14 +150,15 @@ _All runs: 610 updates (~5M steps), seed 42, 1000 eval games. Date: 2026-03-31._
 | 512x2 | -38.8 (17.9%) | -38.6 (21.1%) | **-34.4 (21.1%)** | 1e-3 |
 | 1024x2 | -51.3 (11.6%) | **-32.6 (22.2%)** | -40.7 (17.3%) | 3e-4 |
 
-**Decision:** Optimal LR varies across sizes (no single winner), so Phase 1
-will use per-size LRs as shown above. The pattern is not monotonic — 3e-4
-wins for 64x2, 256x2, and 1024x2, while 1e-3 wins for 128x2 and 512x2.
+**Decision:** Using **3e-4 for all sizes** in Phase 1. Rationale: 3e-4 wins
+3/5 sizes, is never bad (always 1st or 2nd), and 1e-3 has a clear failure
+mode on 1024x2. The margins where 1e-3 "wins" are within noise (1 seed,
+1000 games). A single LR also gives a cleaner experiment — performance
+differences in Phase 1 can be attributed to model capacity, not LR tuning.
 1e-4 was consistently worst. No entropy collapse observed at any size.
 
 **Note:** 1000 eval games gives SE ~1.6% at 50% win rate. Some margins are
 tight (e.g., 512x2: 3e-4 and 1e-3 tied at 21.1% WR, decided by avg score).
-These selections are best-effort given the calibration budget.
 
 
 ### Phase 1: Model size scaling (priority: high)
