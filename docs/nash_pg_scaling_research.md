@@ -214,18 +214,21 @@ PYTHONPATH=.:build/python env3.12/bin/python \
 _Scores are avg_score_vs_committer (win_rate_vs_committer). Bold = selected._
 _All runs: 610 updates (~5M steps), seed 42, 1000 eval games, LR=3e-4._
 
-| Config | MC=0.05 score | MC=0.2 score | MC=1.0 score | Selected MC |
-|---|---|---|---|---|
-| 128x2 | **-18.7 (31.6%)** | -33.2 (20.6%) | -95.7 (1.1%) | 0.05 |
-| 512x2 | **-22.6 (29.6%)** | -40.3 (17.8%) | -106.9 (0.4%) | 0.05 |
+| Config | MC=0.0 | MC=0.00005 | MC=0.0005 | MC=0.005 | MC=0.05 | MC=0.2 | MC=1.0 |
+|---|---|---|---|---|---|---|---|
+| 128x2 | -22.3 (30.4%) | -20.7 (29.5%) | **-15.1 (34.5%)** | -18.3 (31.8%) | -18.7 (31.6%) | -33.2 (20.6%) | -95.7 (1.1%) |
+| 512x2 | -19.6 (33.8%) | -22.4 (27.0%) | **-16.2 (37.0%)** | -22.8 (28.1%) | -22.6 (29.6%) | -40.3 (17.8%) | -106.9 (0.4%) |
 
-_Date: 2026-03-31._
+_Date: 2026-03-31. Three rounds of sweeps: {0.05, 0.2, 1.0}, then {0.005, 0.0005},
+then {0.00005, 0.0}._
 
-**Decision:** Using **magnetic_cost=0.05** for all sizes in Phase 1. The signal
-is unambiguous: 0.05 wins at both sizes by large margins (~12% WR, ~15 score
-points over 0.2). MC=1.0 effectively kills learning. The default of 0.2 was
-too conservative — the inner PPO loop needs more freedom to move away from the
-magnetic reference each outer step.
+**Decision:** Using **magnetic_cost=0.0005** for all sizes in Phase 1. The sweep
+reveals a clear peak at MC=0.0005 at both model sizes. Going higher (0.2, 1.0)
+progressively strangles learning; going lower (0.00005, 0.0) also degrades
+performance. This confirms the magnetic regularization *does* help — the NashPG
+mechanism contributes — but the original default of 0.2 was ~400× too strong.
+The optimal value lets the inner PPO loop move substantially from the reference
+while still benefiting from the outer-loop convergence guarantees.
 
 
 ### Phase 1: Model size scaling (priority: high)
@@ -235,7 +238,7 @@ holding hyperparameters and evaluation constant.
 
 **Protocol:**
 - Train each config for 25M env steps (~3050 updates at 64 envs × 128 steps).
-- Use LR=3e-4 (from Phase 0) and magnetic_cost=0.05 (from Phase 0.5).
+- Use LR=3e-4 (from Phase 0) and magnetic_cost=0.0005 (from Phase 0.5).
 - 3 seeds per config (42, 43, 44).
 - Log eval metrics every 50 updates (5000 games, player-alternated).
 - If a model is still improving at 25M steps, extend training by resuming
