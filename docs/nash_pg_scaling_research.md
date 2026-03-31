@@ -139,13 +139,25 @@ PYTHONPATH=.:build/python env3.12/bin/python \
 
 #### Phase 0 Results
 
+_Scores are avg_score_vs_committer (win_rate_vs_committer). Bold = selected._
+_All runs: 610 updates (~5M steps), seed 42, 1000 eval games. Date: 2026-03-31._
+
 | Config | LR=1e-4 score | LR=3e-4 score | LR=1e-3 score | Selected LR |
 |---|---|---|---|---|
-| 64x2 | | | | |
-| 128x2 | | | | |
-| 256x2 | | | | |
-| 512x2 | | | | |
-| 1024x2 | | | | |
+| 64x2 | -64.0 (6.2%) | **-39.1 (16.4%)** | -43.5 (15.2%) | 3e-4 |
+| 128x2 | -48.6 (10.5%) | -39.9 (16.1%) | **-34.5 (21.1%)** | 1e-3 |
+| 256x2 | -43.4 (15.0%) | **-38.5 (20.2%)** | -40.8 (18.8%) | 3e-4 |
+| 512x2 | -38.8 (17.9%) | -38.6 (21.1%) | **-34.4 (21.1%)** | 1e-3 |
+| 1024x2 | -51.3 (11.6%) | **-32.6 (22.2%)** | -40.7 (17.3%) | 3e-4 |
+
+**Decision:** Optimal LR varies across sizes (no single winner), so Phase 1
+will use per-size LRs as shown above. The pattern is not monotonic — 3e-4
+wins for 64x2, 256x2, and 1024x2, while 1e-3 wins for 128x2 and 512x2.
+1e-4 was consistently worst. No entropy collapse observed at any size.
+
+**Note:** 1000 eval games gives SE ~1.6% at 50% win rate. Some margins are
+tight (e.g., 512x2: 3e-4 and 1e-3 tied at 21.1% WR, decided by avg score).
+These selections are best-effort given the calibration budget.
 
 
 ### Phase 1: Model size scaling (priority: high)
