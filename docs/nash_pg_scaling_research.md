@@ -216,10 +216,16 @@ _All runs: 610 updates (~5M steps), seed 42, 1000 eval games, LR=3e-4._
 
 | Config | MC=0.05 score | MC=0.2 score | MC=1.0 score | Selected MC |
 |---|---|---|---|---|
-| 128x2 | | | | |
-| 512x2 | | | | |
+| 128x2 | **-18.7 (31.6%)** | -33.2 (20.6%) | -95.7 (1.1%) | 0.05 |
+| 512x2 | **-22.6 (29.6%)** | -40.3 (17.8%) | -106.9 (0.4%) | 0.05 |
 
-**Decision:** _(to be filled in after runs)_
+_Date: 2026-03-31._
+
+**Decision:** Using **magnetic_cost=0.05** for all sizes in Phase 1. The signal
+is unambiguous: 0.05 wins at both sizes by large margins (~12% WR, ~15 score
+points over 0.2). MC=1.0 effectively kills learning. The default of 0.2 was
+too conservative — the inner PPO loop needs more freedom to move away from the
+magnetic reference each outer step.
 
 
 ### Phase 1: Model size scaling (priority: high)
@@ -229,7 +235,7 @@ holding hyperparameters and evaluation constant.
 
 **Protocol:**
 - Train each config for 25M env steps (~3050 updates at 64 envs × 128 steps).
-- Use LR=3e-4 (from Phase 0) and magnetic_cost from Phase 0.5.
+- Use LR=3e-4 (from Phase 0) and magnetic_cost=0.05 (from Phase 0.5).
 - 3 seeds per config (42, 43, 44).
 - Log eval metrics every 50 updates (5000 games, player-alternated).
 - If a model is still improving at 25M steps, extend training by resuming
