@@ -27,6 +27,7 @@ Resume from checkpoint:
     --checkpoint_dir=checkpoints/lost_cities_nash_pg
 """
 
+import json
 import pathlib
 import time
 
@@ -54,7 +55,7 @@ flags.DEFINE_integer("total_updates", 10000,
                      "Total number of PPO update rounds.")
 flags.DEFINE_integer("eval_every", 50,
                      "Update frequency at which the agent is evaluated.")
-flags.DEFINE_integer("eval_games", 200,
+flags.DEFINE_integer("eval_games", 5000,
                      "Number of games per evaluation round.")
 flags.DEFINE_integer("checkpoint_every", 200,
                      "Update frequency at which checkpoints are saved.")
@@ -81,7 +82,7 @@ flags.DEFINE_string("checkpoint_dir", "checkpoints/lost_cities_nash_pg",
 
 
 def save_checkpoint(agent, checkpoint_dir, update, outer_step):
-  """Save agent networks and training state."""
+  """Save agent networks, training state, and hyperparameter config."""
   ckpt_path = pathlib.Path(checkpoint_dir)
   ckpt_path.mkdir(parents=True, exist_ok=True)
 
@@ -89,6 +90,11 @@ def save_checkpoint(agent, checkpoint_dir, update, outer_step):
 
   meta = {"update": update, "outer_step": outer_step}
   torch.save(meta, ckpt_path / "meta.pt")
+
+  config = FLAGS.flag_values_dict()
+  with open(ckpt_path / "config.json", "w") as f:
+    json.dump(config, f, indent=2, default=str)
+
   logging.info("Checkpoint saved at update %d (outer step %d) to %s",
                update, outer_step, ckpt_path)
 
@@ -107,6 +113,26 @@ def load_checkpoint(agent, checkpoint_dir):
   meta = torch.load(meta_file, weights_only=True)
   agent.restore(str(ckpt_path))
 
+  # Warn if current flags differ from the saved config
+  config_file = ckpt_path / "config.json"
+  if config_file.exists():
+    with open(config_file) as f:
+      saved_config = json.load(f)
+    # Check training-relevant flags (not paths/logdir)
+    check_keys = [
+        "hidden_layers_sizes", "learning_rate", "entropy_cost",
+        "magnetic_cost", "magnetic_divergence", "clip_coef", "gamma",
+        "gae_lambda", "update_epochs", "num_minibatches", "num_envs",
+        "num_steps", "outer_loop_every",
+    ]
+    for key in check_keys:
+      saved_val = saved_config.get(key)
+      current_val = FLAGS[key].value
+      if saved_val is not None and str(saved_val) != str(current_val):
+        logging.warning(
+            "Flag --%s differs from checkpoint: saved=%s, current=%s",
+            key, saved_val, current_val)
+
   update = meta["update"]
   outer_step = meta.get("outer_step", 0)
   logging.info("Resumed from checkpoint at update %d (outer step %d)",
@@ -115,25 +141,28 @@ def load_checkpoint(agent, checkpoint_dir):
 
 
 def eval_vs_random(game, agent, rng, num_games, device="cpu"):
-  """Evaluate the agent (player 0) vs a random opponent."""
+  """Evaluate the agent vs a random opponent, alternating player seats."""
   wins = 0
   total_return = 0.0
 
-  for _ in range(num_games):
+  for game_num in range(num_games):
+    agent_player = game_num % 2
     state = game.new_initial_state()
     while not state.is_terminal():
       if state.is_chance_node():
         outcomes = state.chance_outcomes()
         action_list, prob_list = zip(*outcomes)
         action = rng.choice(action_list, p=prob_list)
-      elif state.current_player() == 0:
+      elif state.current_player() == agent_player:
         obs = {
             "info_state": [None, None],
             "legal_actions": [None, None],
-            "current_player": 0,
+            "current_player": agent_player,
         }
-        obs["info_state"][0] = state.information_state_tensor(0)
-        obs["legal_actions"][0] = state.legal_actions(0)
+        obs["info_state"][agent_player] = (
+            state.information_state_tensor(agent_player))
+        obs["legal_actions"][agent_player] = (
+            state.legal_actions(agent_player))
         ts = rl_environment.TimeStep(
             observations=obs, rewards=None, discounts=None, step_type=None)
         action = agent.step([ts], is_evaluation=True)[0].action
@@ -143,20 +172,23 @@ def eval_vs_random(game, agent, rng, num_games, device="cpu"):
       state.apply_action(action)
 
     returns = state.returns()
-    total_return += returns[0]
-    if returns[0] > 0:
+    total_return += returns[agent_player]
+    if returns[agent_player] > 0:
       wins += 1
 
   return wins, total_return / num_games
 
 
 def eval_vs_committer(game, agent, rng, num_games, device="cpu"):
-  """Evaluate the agent (player 0) vs CommitterBot (player 1)."""
-  committer = lost_cities_committer.LostCitiesCommitterBot(1, rng)
+  """Evaluate the agent vs CommitterBot, alternating player seats."""
   wins = 0
   total_return = 0.0
 
-  for _ in range(num_games):
+  for game_num in range(num_games):
+    agent_player = game_num % 2
+    committer_player = 1 - agent_player
+    committer = lost_cities_committer.LostCitiesCommitterBot(
+        committer_player, rng)
     state = game.new_initial_state()
     committer.restart_at(state)
     while not state.is_terminal():
@@ -164,14 +196,16 @@ def eval_vs_committer(game, agent, rng, num_games, device="cpu"):
         outcomes = state.chance_outcomes()
         action_list, prob_list = zip(*outcomes)
         action = rng.choice(action_list, p=prob_list)
-      elif state.current_player() == 0:
+      elif state.current_player() == agent_player:
         obs = {
             "info_state": [None, None],
             "legal_actions": [None, None],
-            "current_player": 0,
+            "current_player": agent_player,
         }
-        obs["info_state"][0] = state.information_state_tensor(0)
-        obs["legal_actions"][0] = state.legal_actions(0)
+        obs["info_state"][agent_player] = (
+            state.information_state_tensor(agent_player))
+        obs["legal_actions"][agent_player] = (
+            state.legal_actions(agent_player))
         ts = rl_environment.TimeStep(
             observations=obs, rewards=None, discounts=None, step_type=None)
         action = agent.step([ts], is_evaluation=True)[0].action
@@ -180,8 +214,8 @@ def eval_vs_committer(game, agent, rng, num_games, device="cpu"):
       state.apply_action(action)
 
     returns = state.returns()
-    total_return += returns[0]
-    if returns[0] > 0:
+    total_return += returns[agent_player]
+    if returns[agent_player] > 0:
       wins += 1
 
   return wins, total_return / num_games
@@ -257,10 +291,11 @@ def main(unused_argv):
       steps_per_sec = agent.total_steps_done / elapsed
 
       # Log losses
-      pg_loss, v_loss, mag_loss = agent.loss
+      pg_loss, v_loss, mag_loss, ent = agent.loss
       writer.add_scalar("loss/policy", pg_loss or 0, agent.total_steps_done)
       writer.add_scalar("loss/value", v_loss or 0, agent.total_steps_done)
       writer.add_scalar("loss/magnetic", mag_loss or 0, agent.total_steps_done)
+      writer.add_scalar("loss/entropy", ent or 0, agent.total_steps_done)
 
       # Evaluate vs random
       wins, avg_score = eval_vs_random(

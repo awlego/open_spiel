@@ -226,10 +226,12 @@ class NashPGAgent:
     self._last_pg_loss = None
     self._last_v_loss = None
     self._last_mag_loss = None
+    self._last_entropy = None
 
   @property
   def loss(self):
-    return (self._last_pg_loss, self._last_v_loss, self._last_mag_loss)
+    return (self._last_pg_loss, self._last_v_loss, self._last_mag_loss,
+            self._last_entropy)
 
   def step(self, time_steps, is_evaluation=False):
     """Select actions for a batch of environments.
@@ -435,6 +437,7 @@ class NashPGAgent:
     self._last_pg_loss = pg_loss.item()
     self._last_v_loss = v_loss.item()
     self._last_mag_loss = mag_loss.item()
+    self._last_entropy = entropy_loss.item()
 
     # Reset for next rollout
     self.cur_batch_idx = 0
