@@ -96,7 +96,6 @@ Unless noted otherwise, all experiments use these settings:
 
 **Config saving:** Each checkpoint saves a `config.json` with all hyperparameters,
 so runs can be reproduced exactly and resumed without re-specifying flags.
-_(Requires code change — see "Planned Code Changes" section.)_
 
 
 ### Phase 0: Learning rate calibration (run first)
@@ -218,7 +217,7 @@ in general, not just better at exploiting one specific heuristic.
 - Round-robin tournament: every size plays every other size, 5000 games each
   direction (agent as p0 and p1), so 10000 games per matchup.
 - Compute win rate matrix and average score matrix.
-- Requires a cross-play evaluation script (see "Planned Code Changes").
+- Requires a cross-play evaluation script (see "Planned Code Changes — Remaining").
 
 **Analysis questions:**
 - Does cross-play ranking match CommitterBot ranking?
@@ -299,71 +298,37 @@ _To be filled in._
 
 ## Planned Code Changes
 
-The following changes to the training/eval code are needed before starting
-Phase 0. Track these as implementation tasks.
+### Completed
 
-### 1. Player-alternating evaluation
+1. **Player-alternating evaluation** — `eval_vs_random()` and
+   `eval_vs_committer()` now alternate the agent between player 0 and
+   player 1 each game, removing first-player bias. _(commit `df65b695`)_
 
-**Files:** `open_spiel/python/examples/nash_pg_lost_cities_pytorch.py`
+2. **Save hyperparameter config with checkpoints** — `save_checkpoint()`
+   writes `config.json` with all FLAGS values; `load_checkpoint()` warns
+   if training-relevant flags differ from the saved config. _(commit `df65b695`)_
 
-Modify `eval_vs_random()` and `eval_vs_committer()` to play half the games
-with the agent as player 0 and half as player 1. This removes first-player
-bias from evaluation.
+3. **Log policy entropy to TensorBoard** — `agent.loss` now returns a
+   4-tuple including raw entropy; logged as `loss/entropy`. _(commit `df65b695`)_
 
-Changes:
-- Add `agent_player` parameter to both eval functions.
-- In the game loop, swap which player the agent controls based on
-  `agent_player`.
-- For CommitterBot, instantiate with the opposite player_id.
-- Call each eval function in a loop over both positions, averaging results.
+### Remaining
 
-### 2. Save hyperparameter config with checkpoints
+4. **Cross-play evaluation script** _(needed before Phase 1.5)_
 
-**Files:** `open_spiel/python/examples/nash_pg_lost_cities_pytorch.py`
+   New script `open_spiel/python/examples/nash_pg_cross_play.py` to load
+   two checkpoints and play them against each other.
 
-Save a `config.json` alongside each checkpoint containing all FLAGS values.
-This ensures runs can be reproduced exactly and makes it easy to verify that
-a resumed run uses matching hyperparameters.
+   Interface:
+   ```bash
+   PYTHONPATH=.:build/python env3.12/bin/python \
+     open_spiel/python/examples/nash_pg_cross_play.py \
+     --checkpoint_a=checkpoints/scaling_256x2_s42 \
+     --checkpoint_b=checkpoints/scaling_512x2_s42 \
+     --num_games=10000
+   ```
 
-Changes:
-- In `save_checkpoint()`, write `config.json` with `FLAGS.flag_values_dict()`.
-- In `load_checkpoint()`, optionally warn if current flags differ from saved
-  config.
-
-### 3. Log policy entropy to TensorBoard
-
-**Files:** `open_spiel/python/pytorch/nash_pg.py`,
-`open_spiel/python/examples/nash_pg_lost_cities_pytorch.py`
-
-Expose actual policy entropy (not entropy_cost × entropy) so it can be
-logged to TensorBoard. This is diagnostic for whether larger models suffer
-entropy collapse.
-
-Changes:
-- In `learn()`, track mean entropy alongside losses.
-- Expose via `agent.entropy` or extend the `agent.loss` tuple.
-- Log as `loss/entropy` in the training script.
-
-### 4. Cross-play evaluation script
-
-**Files:** New script `open_spiel/python/examples/nash_pg_cross_play.py`
-
-Load two checkpoints and play them against each other. Used for Phase 1.5.
-
-Interface:
-```bash
-PYTHONPATH=.:build/python env3.12/bin/python \
-  open_spiel/python/examples/nash_pg_cross_play.py \
-  --checkpoint_a=checkpoints/scaling_256x2_s42 \
-  --checkpoint_b=checkpoints/scaling_512x2_s42 \
-  --hidden_layers_sizes_a=256,256 \
-  --hidden_layers_sizes_b=512,512 \
-  --num_games=10000
-```
-
-Note: once config.json saving is implemented (#2), the script can read
-network architecture from the checkpoint dir instead of requiring it on
-the command line.
+   The script can read network architecture from each checkpoint's
+   `config.json` automatically.
 
 ---
 
