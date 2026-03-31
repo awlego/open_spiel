@@ -160,6 +160,67 @@ differences in Phase 1 can be attributed to model capacity, not LR tuning.
 **Note:** 1000 eval games gives SE ~1.6% at 50% win rate. Some margins are
 tight (e.g., 512x2: 3e-4 and 1e-3 tied at 21.1% WR, decided by avg score).
 
+**Diagnostic note:** The TensorBoard tag `loss/magnetic` already logs the raw
+KL(current || reference) divergence — this is computed *before* multiplying by
+`magnetic_cost`. So this tag directly shows how far the policy moves from the
+reference each inner loop, regardless of the regularization coefficient. This
+is the key diagnostic for tuning `magnetic_cost` (see Phase 0.5).
+
+
+### Phase 0.5: Magnetic cost calibration
+
+**Goal:** Ensure that `magnetic_cost=0.2` (the default) isn't wrong for any
+model size before committing to Phase 1. This parameter controls how tightly
+the inner PPO loop stays near the magnetic reference policy — too high and
+each outer step barely moves, too low and convergence guarantees weaken.
+
+**Protocol:**
+- For 2 representative model sizes (128x2 and 512x2), run a 3-point sweep:
+  magnetic_cost ∈ {0.05, 0.2, 1.0}.
+- LR = 3e-4 for all runs (from Phase 0 decision).
+- Train for 5M steps (~610 updates), seed 42 only.
+- Eval settings: 1000 games vs committer, 100 games vs random.
+- Eval frequency: eval only at end of run (`--eval_every=610`).
+- Total: 6 short runs (2 sizes × 3 values).
+- Wall-clock estimate: ~30 min at 2 parallel, ~1 hour sequential.
+
+**Decision rule:**
+- If 0.2 wins or ties at both sizes → keep 0.2 everywhere for Phase 1.
+- If optimal value varies across sizes → use per-size values for Phase 1
+  and note the relationship (this is itself a useful scaling finding).
+
+**Secondary diagnostic:** Compare `loss/magnetic` (raw KL from reference) at
+the end of each run. If the KL is very different across magnetic_cost values,
+that tells us the parameter is actually shaping training behavior, not just
+rescaling the loss.
+
+**Command template:**
+```bash
+PYTHONPATH=.:build/python env3.12/bin/python \
+  open_spiel/python/examples/nash_pg_lost_cities_pytorch.py \
+  --hidden_layers_sizes=WIDTH,WIDTH \
+  --learning_rate=3e-4 \
+  --magnetic_cost=MC \
+  --total_updates=610 \
+  --eval_every=610 \
+  --eval_games=1000 \
+  --seed=42 \
+  --checkpoint_dir=checkpoints/phase05_WIDTHx2_mcMC \
+  --logdir=runs/phase05_WIDTHx2_mcMC
+```
+
+#### Phase 0.5 Results
+
+_Scores are avg_score_vs_committer (win_rate_vs_committer). Bold = selected._
+_All runs: 610 updates (~5M steps), seed 42, 1000 eval games, LR=3e-4._
+
+| Config | MC=0.05 score | MC=0.2 score | MC=1.0 score | Selected MC |
+|---|---|---|---|---|
+| 128x2 | | | | |
+| 512x2 | | | | |
+
+**Decision:** _(to be filled in after runs)_
+
 
 ### Phase 1: Model size scaling (priority: high)
 
@@ -167,22 +228,22 @@ tight (e.g., 512x2: 3e-4 and 1e-3 tied at 21.1% WR, decided by avg score).
 holding hyperparameters and evaluation constant.
 
 **Protocol:**
-- Train each config for 50M env steps (~6100 updates at 64 envs × 128 steps).
-- Use the per-size LR selected in Phase 0 (all other hyperparameters default).
+- Train each config for 25M env steps (~3050 updates at 64 envs × 128 steps).
+- Use LR=3e-4 (from Phase 0) and magnetic_cost from Phase 0.5.
 - 3 seeds per config (42, 43, 44).
 - Log eval metrics every 50 updates (5000 games, player-alternated).
-- If a model is still improving at 50M steps, extend training by resuming
+- If a model is still improving at 25M steps, extend training by resuming
   from checkpoint (rerun the command with a higher `--total_updates`).
 - Total: 15 full runs (5 sizes × 3 seeds).
 
-**Primary metrics at 50M steps:**
+**Primary metrics at 25M steps:**
 - Win rate vs committer (mean ± std across seeds)
 - Avg score vs committer (finer-grained signal)
 
 **Secondary metrics:**
 - **Sample efficiency:** Steps to reach 30% win rate vs committer
   (first seed-averaged crossing)
-- **Wall-clock time:** Total hours to 50M steps per config
+- **Wall-clock time:** Total hours to 25M steps per config
 - **Wall-clock efficiency:** Win rate vs committer at 1 wall-clock hour
 - **Value loss trajectory:** Diagnostic for critic capacity
 
@@ -196,27 +257,30 @@ holding hyperparameters and evaluation constant.
 | 512x2 | 512,512 | 906K | 33.1ms | Not started |
 | 1024x2 | 1024,1024 | 2.9M | 53.5ms | Not started |
 
+**Status:** Phase 1 paused pending Phase 0.5 (magnetic_cost calibration).
+Early Phase 1 runs were started but stopped to avoid confounding results.
+
 **Command template:**
 ```bash
 PYTHONPATH=.:build/python env3.12/bin/python \
   open_spiel/python/examples/nash_pg_lost_cities_pytorch.py \
   --hidden_layers_sizes=WIDTH,WIDTH \
   --learning_rate=LR_FROM_PHASE_0 \
-  --total_updates=6100 \
+  --total_updates=3050 \
   --eval_games=5000 \
   --seed=SEED \
   --checkpoint_dir=checkpoints/scaling_WIDTHx2_sSEED \
   --logdir=runs/scaling_WIDTHx2_sSEED
 ```
 
-**Analysis:** Plot win_rate_vs_committer (y) vs log10(params) (x) at 50M steps.
+**Analysis:** Plot win_rate_vs_committer (y) vs log10(params) (x) at 25M steps.
 Look for: diminishing returns / plateau, or continued scaling.
 
 #### Phase 1 Results
 
 _All win rates and scores are mean ± std across 3 seeds._
 
-| Config | Params | LR | Win rate vs committer (50M) | Avg score | Steps to 30% WR | Wall-clock (hrs) | WR at 1hr | Value loss |
+| Config | Params | LR | Win rate vs committer (25M) | Avg score | Steps to 30% WR | Wall-clock (hrs) | WR at 1hr | Value loss |
 |---|---|---|---|---|---|---|---|---|
 | 64x2 | ~50K | | | | | | | |
 | 128x2 | 128K | | | | | | | |
@@ -367,7 +431,7 @@ PYTHONPATH=.:build/python env3.12/bin/python \
   open_spiel/python/examples/nash_pg_lost_cities_pytorch.py \
   --hidden_layers_sizes=256,256 \
   --learning_rate=3e-4 \
-  --total_updates=6100 \
+  --total_updates=3050 \
   --eval_games=5000 \
   --seed=42 \
   --checkpoint_dir=checkpoints/scaling_256x2_s42 \
@@ -377,7 +441,7 @@ PYTHONPATH=.:build/python env3.12/bin/python \
 Runs can be resumed from checkpoint — just re-run the same command. The
 training loop picks up from the last saved update.
 
-To extend a completed run (e.g., if still improving at 50M steps):
+To extend a completed run (e.g., if still improving at 25M steps):
 ```bash
 # Same command but with more updates
 PYTHONPATH=.:build/python env3.12/bin/python \
