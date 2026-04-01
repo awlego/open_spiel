@@ -260,14 +260,12 @@ holding hyperparameters and evaluation constant.
 
 | Name | Hidden layers | Params | Inference (8192 batch) | Status |
 |---|---|---|---|---|
-| 64x2 | 64,64 | ~50K | ~22ms (est.) | Not started |
-| 128x2 | 128,128 | 128K | 23.7ms | Partial (15M steps, see Run 1) |
-| 256x2 | 256,256 | 322K | 26.4ms | Not started |
-| 512x2 | 512,512 | 906K | 33.1ms | Not started |
-| 1024x2 | 1024,1024 | 2.9M | 53.5ms | Not started |
-
-**Status:** Phase 1 paused pending Phase 0.5 (magnetic_cost calibration).
-Early Phase 1 runs were started but stopped to avoid confounding results.
+| 32x2 | 32,32 | ~20K | ~20ms (est.) | Complete |
+| 64x2 | 64,64 | ~50K | ~22ms (est.) | Complete |
+| 128x2 | 128,128 | 128K | 23.7ms | Complete |
+| 256x2 | 256,256 | 322K | 26.4ms | Complete |
+| 512x2 | 512,512 | 906K | 33.1ms | Complete |
+| 1024x2 | 1024,1024 | 2.9M | 53.5ms | Complete |
 
 **Command template:**
 ```bash
@@ -289,13 +287,29 @@ Look for: diminishing returns / plateau, or continued scaling.
 
 _All win rates and scores are mean ± std across 3 seeds._
 
-| Config | Params | LR | Win rate vs committer (25M) | Avg score | Steps to 30% WR | Wall-clock (hrs) | WR at 1hr | Value loss |
-|---|---|---|---|---|---|---|---|---|
-| 64x2 | ~50K | | | | | | | |
-| 128x2 | 128K | | | | | | | |
-| 256x2 | 322K | | | | | | | |
-| 512x2 | 906K | | | | | | | |
-| 1024x2 | 2.9M | | | | | | | |
+_All runs: LR=3e-4, magnetic_cost=0.0005, 3050 updates (~25M steps), 3 seeds.
+Date: 2026-03-31._
+
+| Config | Params | Win rate vs committer (25M) | Avg score |
+|---|---|---|---|
+| 32x2 | ~20K | 33.8% ± 0.6% | -16.3 ± 0.5 |
+| **64x2** | **~50K** | **34.2% ± 0.9%** | **-16.2 ± 1.2** |
+| 128x2 | 128K | 32.5% ± 1.1% | -18.7 ± 1.5 |
+| 256x2 | 322K | 31.2% ± 0.4% | -21.0 ± 0.7 |
+| 512x2 | 906K | 29.8% ± 1.3% | -22.5 ± 1.7 |
+| 1024x2 | 2.9M | 28.1% ± 1.1% | -25.6 ± 1.6 |
+
+**Key finding: Inverse scaling at fixed compute budget.** Performance monotonically
+decreases with model size above 64x2. The smallest models (32x2, 64x2) are
+essentially tied at ~34% WR, while each subsequent doubling costs ~1-2% WR.
+The relationship is roughly linear in log(params): ~-3% WR per 10× params.
+
+**Interpretation:** At 25M steps, larger models are less sample-efficient — they
+haven't had enough updates to leverage their additional capacity. This does NOT
+mean larger models can't eventually surpass smaller ones; they may just need
+proportionally more training. The Phase 2 learning curves (from TensorBoard logs)
+will show whether larger models are still improving at 25M steps while smaller
+ones have plateaued, which would suggest extending training could flip the ranking.
 
 
 ### Phase 1.5: Cross-play evaluation
