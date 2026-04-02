@@ -299,17 +299,90 @@ Date: 2026-03-31._
 | 512x2 | 906K | 29.8% ± 1.3% | -22.5 ± 1.7 |
 | 1024x2 | 2.9M | 28.1% ± 1.1% | -25.6 ± 1.6 |
 
-**Key finding: Inverse scaling at fixed compute budget.** Performance monotonically
-decreases with model size above 64x2. The smallest models (32x2, 64x2) are
-essentially tied at ~34% WR, while each subsequent doubling costs ~1-2% WR.
-The relationship is roughly linear in log(params): ~-3% WR per 10× params.
+**Initial finding: Inverse scaling at fixed 25M step budget.** Performance
+monotonically decreases with model size above 64x2 at 25M steps. But see
+Phase 2 long runs below — this reverses with more training and proper MC tuning.
 
-**Interpretation:** At 25M steps, larger models are less sample-efficient — they
-haven't had enough updates to leverage their additional capacity. This does NOT
-mean larger models can't eventually surpass smaller ones; they may just need
-proportionally more training. The Phase 2 learning curves (from TensorBoard logs)
-will show whether larger models are still improving at 25M steps while smaller
-ones have plateaued, which would suggest extending training could flip the ranking.
+
+### Phase 2: Long runs and MC-size interaction
+
+**Goal:** Determine whether larger models can surpass smaller ones with more
+training, and whether the optimal magnetic_cost depends on model size.
+
+**Protocol:** Extended single-seed (42) runs at various MC values, 6-9 hours each.
+All use LR=3e-4, eval every 50 updates with 5000 games. Date: 2026-04-01.
+
+#### Phase 2a: MC interaction for large models
+
+512x2 runs at matched steps (~57M), varying MC:
+
+| MC | Steps | WR vs committer | Avg score | Trajectory |
+|---|---|---|---|---|
+| 0.0 | 57M | 33.2% | -19.2 | steady climb |
+| 0.0005 + OL=25 | 57M | 33.3% | -18.6 | steady climb |
+| 0.05 | 57M | 30.8% | -20.9 | flat |
+| 0.2 | 57M | 32.6% | -18.5 | steady climb |
+
+**Finding:** For 512x2, MC barely matters at 57M steps — all values converge to
+~31-33%. Extended to 98M steps, MC=0.0 reached 35.5% and was still climbing.
+
+1024x2 runs at matched steps (~66M), varying MC:
+
+| MC | Steps | WR vs committer | Avg score | Trajectory |
+|---|---|---|---|---|
+| 0.0005 (Phase 1) | 25M | 28.1% | -25.6 | peaked, regressed |
+| 0.05 | 66M | 32.9% | -20.4 | flattening |
+| **0.2** | **66M** | **35.2%** | **-16.4** | **still climbing** |
+
+**Finding:** For 1024x2, MC=0.2 (the original default!) is clearly best — 2.3%
+ahead of MC=0.05 and still climbing while MC=0.05 flattens. Larger models need
+stronger magnetic regularization to stabilize training.
+
+#### Phase 2b: Long-run leaderboard
+
+Best result per model size, extended training:
+
+| Config | MC | Params | Steps | WR vs committer | Avg score | Status |
+|---|---|---|---|---|---|---|
+| 4x2 | 0.0005 | ~2.5K | 123M | 28.5% | -21.6 | peaked, declining |
+| 8x2 | 0.0005 | ~4K | 123M | 31.7% | -18.4 | peaked, declining |
+| 16x2 | 0.0005 | ~8K | 123M | 36.5% | -13.7 | noisy plateau |
+| 64x2 | 0.0005 | ~50K | 205M | 40.7% | -9.4 | still climbing |
+| **256x2** | **0.05** | **322K** | **123M** | **40.0%** | **-11.1** | **still climbing** |
+| 512x2 | 0.0 | 906K | 98M | 35.5% | -16.4 | still climbing |
+| 1024x2 | 0.2 | 2.9M | 66M | 35.2% | -16.4 | still climbing |
+
+#### Phase 2c: Key findings
+
+**1. Scaling works — with enough training and proper MC tuning.**
+The Phase 1 "inverse scaling" was a sample efficiency artifact. At 123M matched
+steps, 256x2 (40.0%) beats 64x2 (38.0%) beats 16x2 (36.5%) beats 8x2 (31.7%).
+Larger models have higher ceilings but need proportionally more steps to reach them.
+
+**2. Optimal MC scales with model size.**
+This is the most actionable finding. At 5M calibration steps, MC=0.0005 won for
+all sizes — but that was misleading. With longer training:
+- Small models (64x2): MC=0.0005 works well
+- Medium models (256x2): MC=0.05 works well
+- Large models (1024x2): MC=0.2 works well
+The larger the model, the more it can drift from the magnetic reference each
+inner loop, requiring stronger anchoring to prevent cycling.
+
+**3. Capacity floor around 16x2 (~8K params).**
+Models below 16x2 peak and regress — they lack capacity to represent a strong
+policy for Lost Cities (295-dim info state, 151 actions). The 4x2 bottleneck
+(295→4→4→151) is too severe.
+
+**4. All models above 64x2 are still climbing.**
+No model has been trained to its ceiling yet. The 256x2 at MC=0.05 and 1024x2
+at MC=0.2 both show strong upward trajectories at the end of their runs. More
+training would likely push them higher.
+
+**5. Phase 1's "regression" was insufficient training, not cycling.**
+The 512x2 MC=0.0 run (pure PPO, no magnetic regularization) showed steady
+monotonic improvement over 98M steps with no peak-then-decline. The apparent
+regression in Phase 1 was simply larger models needing more steps, compounded
+by evaluating at only 25M steps.
 
 
 ### Phase 1.5: Cross-play evaluation
@@ -340,28 +413,6 @@ _Cross-play win rate matrix (row player's win rate, averaged across both seats):
 | **256x2** | | | — | | |
 | **512x2** | | | | — | |
 | **1024x2** | | | | | — |
-
-
-### Phase 2: Compute scaling + sample efficiency
-
-**Goal:** For each model size, determine how performance improves with more
-training steps. Find compute-optimal configurations (Chinchilla-style).
-
-**Protocol:**
-- Use the same Phase 1 runs (they already log at regular intervals).
-- For each model size, plot performance vs log(env_steps).
-- Overlay all sizes on one chart.
-- Also plot performance vs wall-clock hours (secondary axis).
-
-**Analysis questions:**
-- Do larger models learn faster *per step*, or just reach a higher ceiling?
-- At what step count does each model plateau?
-- Given a fixed wall-clock budget (e.g., 1 hour), what's the optimal model size?
-- Plot: steps_to_30%_WR vs params — is there a power law?
-
-#### Phase 2 Results
-
-_Extract from Phase 1 TensorBoard logs. Plot performance vs steps for all sizes._
 
 
 ### Phase 3: Depth vs width (priority: low)
@@ -518,6 +569,32 @@ the 3 seeds.
 - If cross-play shows that CommitterBot rankings don't match general strength
   rankings, the evaluation protocol needs revision before drawing scaling
   conclusions.
+
+---
+
+## Reference: Training Time Breakdown by Network Size
+
+Profiled with `nash_pg_profile.py`, 64 envs × 128 steps, 10 updates.
+Commit `7c879efa`. Date: 2026-04-01.
+
+| Network | steps/s | env.step % | agent.step % | learn % | learn (ms/update) |
+|---|---|---|---|---|---|
+| 4x2 | 11,913 | **42.5** | 30.3 | 21.3 | 146 |
+| 8x2 | 11,846 | **42.1** | 30.1 | 22.1 | 153 |
+| 16x2 | 11,949 | **42.1** | 29.0 | 23.1 | 158 |
+| 32x2 | 11,581 | **42.0** | 27.8 | 24.4 | 172 |
+| 64x2 | 10,926 | **39.6** | 29.3 | 25.5 | 191 |
+| 128x2 | 10,585 | **38.1** | 28.5 | 28.2 | 218 |
+| 256x2 | 9,418 | 34.8 | 26.9 | **33.5** | 291 |
+| 512x2 | 7,980 | 28.5 | 25.9 | **41.8** | 429 |
+| 1024x2 | 4,729 | 18.0 | 26.6 | **52.9** | 917 |
+
+**Observations:**
+- `env.step()` is constant at ~2.9s regardless of network size (pure game logic).
+- Below 256x2, env stepping is the bottleneck — parallelizing it (AsyncVectorEnv)
+  would give the biggest speedup.
+- Above 256x2, `learn()` dominates and scales roughly linearly with params.
+- `agent.step()` (forward pass) grows slowly: 1.6ms at 4x2 → 3.6ms at 1024x2.
 
 ---
 
