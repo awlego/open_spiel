@@ -309,8 +309,9 @@ Phase 2 long runs below — this reverses with more training and proper MC tunin
 **Goal:** Determine whether larger models can surpass smaller ones with more
 training, and whether the optimal magnetic_cost depends on model size.
 
-**Protocol:** Extended single-seed (42) runs at various MC values, 6-9 hours each.
-All use LR=3e-4, eval every 50 updates with 5000 games. Date: 2026-04-01.
+**Protocol:** Extended single-seed (42) runs at various MC values.
+All use LR=3e-4, eval every 50 updates with 5000 games.
+Date: 2026-04-01 through 2026-04-03.
 
 #### Phase 2a: MC interaction for large models
 
@@ -338,51 +339,115 @@ All use LR=3e-4, eval every 50 updates with 5000 games. Date: 2026-04-01.
 ahead of MC=0.05 and still climbing while MC=0.05 flattens. Larger models need
 stronger magnetic regularization to stabilize training.
 
-#### Phase 2b: Long-run leaderboard
+#### Phase 2b: MC comparison across sizes (extended runs)
 
-Best result per model size, extended training:
+512x2 MC comparison:
+
+| MC | Steps | WR vs committer | Avg score | Notes |
+|---|---|---|---|---|
+| 0.05 | 88M | 34.8% | -16.3 | climbing |
+| **0.2** | **88M** | **37.0%** | **-13.8** | **climbing, MC=0.2 winning** |
+
+256x2 MC comparison:
+
+| MC | Steps | WR vs committer | Avg score | Notes |
+|---|---|---|---|---|
+| **0.05** | **523M** | **48.3%** | **-1.5** | **still climbing** |
+| 0.2 | 111M | 40.4% | -10.0 | behind at matched steps |
+
+128x2 MC comparison:
+
+| MC | Steps | WR vs committer | Avg score | Notes |
+|---|---|---|---|---|
+| 0.0005 (Phase 1) | 25M | 32.5% | -18.7 | |
+| 0.01 | 121M | 39.3% | -11.1 | MC=0.01 much better than 0.0005 |
+
+Depth comparison (256-wide):
+
+| Config | Params | MC | Steps | WR vs committer | Avg score |
+|---|---|---|---|---|---|
+| 256x2 | 322K | 0.05 | 523M | 48.3% | -1.5 |
+| 256x3 | 454K | 0.05 | 387M | 43.2% | -7.7 |
+
+256x3 was behind early but caught up to ~47% before falling back. At matched
+steps it trails 256x2 — the extra depth doesn't help for this game.
+
+LR comparison (1024x2 MC=0.2):
+
+| LR | Steps | WR vs committer | Notes |
+|---|---|---|---|
+| **3e-4** | **426M** | **48.6%** | **clear winner** |
+| 1e-3 | 131M | 33.0% | higher LR hurts |
+
+Batch size comparison (1024x2 MC=0.2, LR=3e-4):
+
+| Envs | Batch size | Steps | WR vs committer | Notes |
+|---|---|---|---|---|
+| 64 | 8,192 | 66M | 35.2% | original |
+| **256** | **32,768** | **426M** | **48.6%** | **4× batch helps significantly** |
+
+Note: the 256-env run also had more total steps, so the comparison is not
+purely about batch size. But at matched wall-clock time, the 256-env run
+was consistently ahead.
+
+#### Phase 2c: Long-run leaderboard (final, as of 2026-04-03)
+
+Best result per config, all training stopped for architecture exploration.
 
 | Config | MC | Params | Steps | WR vs committer | Avg score | Status |
 |---|---|---|---|---|---|---|
 | 4x2 | 0.0005 | ~2.5K | 123M | 28.5% | -21.6 | peaked, declining |
 | 8x2 | 0.0005 | ~4K | 123M | 31.7% | -18.4 | peaked, declining |
 | 16x2 | 0.0005 | ~8K | 123M | 36.5% | -13.7 | noisy plateau |
-| 64x2 | 0.0005 | ~50K | 205M | 40.7% | -9.4 | still climbing |
-| **256x2** | **0.05** | **322K** | **123M** | **40.0%** | **-11.1** | **still climbing** |
-| 512x2 | 0.0 | 906K | 98M | 35.5% | -16.4 | still climbing |
-| 1024x2 | 0.2 | 2.9M | 66M | 35.2% | -16.4 | still climbing |
+| 128x2 | 0.01 | 128K | 121M | 39.3% | -11.1 | climbing |
+| 64x2 | 0.0005 | ~50K | 670M | 46.7% | -3.4 | slow climb |
+| 256x3 | 0.05 | 454K | 387M | 43.2% | -7.7 | noisy |
+| **256x2** | **0.05** | **322K** | **523M** | **48.3%** | **-1.5** | **climbing** |
+| 512x2 | 0.2 | 906K | 88M | 37.0% | -13.8 | early, climbing |
+| **1024x2** | **0.2** | **2.9M** | **426M** | **48.6%** | **-1.4** | **climbing** |
 
-#### Phase 2c: Key findings
+#### Phase 2d: Key findings
 
 **1. Scaling works — with enough training and proper MC tuning.**
-The Phase 1 "inverse scaling" was a sample efficiency artifact. At 123M matched
-steps, 256x2 (40.0%) beats 64x2 (38.0%) beats 16x2 (36.5%) beats 8x2 (31.7%).
-Larger models have higher ceilings but need proportionally more steps to reach them.
+The Phase 1 "inverse scaling" was a sample efficiency artifact. With extended
+training, the 1024x2 (48.6%) and 256x2 (48.3%) are the strongest agents,
+both approaching 50% WR vs CommitterBot.
 
 **2. Optimal MC scales with model size.**
 This is the most actionable finding. At 5M calibration steps, MC=0.0005 won for
 all sizes — but that was misleading. With longer training:
 - Small models (64x2): MC=0.0005 works well
-- Medium models (256x2): MC=0.05 works well
-- Large models (1024x2): MC=0.2 works well
+- Medium models (128x2): MC=0.01 works well
+- Medium-large models (256x2): MC=0.05 works well
+- Large models (512x2, 1024x2): MC=0.2 works well
 The larger the model, the more it can drift from the magnetic reference each
-inner loop, requiring stronger anchoring to prevent cycling.
+inner loop, requiring stronger anchoring to stabilize training.
 
 **3. Capacity floor around 16x2 (~8K params).**
 Models below 16x2 peak and regress — they lack capacity to represent a strong
 policy for Lost Cities (295-dim info state, 151 actions). The 4x2 bottleneck
 (295→4→4→151) is too severe.
 
-**4. All models above 64x2 are still climbing.**
-No model has been trained to its ceiling yet. The 256x2 at MC=0.05 and 1024x2
-at MC=0.2 both show strong upward trajectories at the end of their runs. More
-training would likely push them higher.
+**4. No model has plateaued yet.**
+Even 64x2 at 670M steps is still climbing (43%→47% over last 260M steps).
+The 256x2 and 1024x2 both show upward trajectories at stop. More training
+would likely push them past 50% vs CommitterBot.
 
-**5. Phase 1's "regression" was insufficient training, not cycling.**
+**5. Width beats depth.** 256x2 outperforms 256x3 at matched steps. The extra
+layer adds params and compute cost without improving performance for this game.
+
+**6. Larger batch size helps large models.** The 1024x2 with 4× batch (256 envs)
+trained significantly faster and reached higher WR than the standard 64-env
+version, likely due to more stable gradient estimates.
+
+**7. LR=3e-4 is robust.** Testing LR=1e-3 for the 1024x2 hurt performance
+significantly (33% vs 49% at comparable training time). The original LR
+calibration holds even for large models with high MC.
+
+**8. Phase 1's "regression" was insufficient training, not cycling.**
 The 512x2 MC=0.0 run (pure PPO, no magnetic regularization) showed steady
 monotonic improvement over 98M steps with no peak-then-decline. The apparent
-regression in Phase 1 was simply larger models needing more steps, compounded
-by evaluating at only 25M steps.
+regression in Phase 1 was simply larger models needing more steps.
 
 
 ### Phase 1.5: Cross-play evaluation
