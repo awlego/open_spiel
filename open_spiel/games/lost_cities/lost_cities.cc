@@ -77,7 +77,7 @@ std::string CardName(int card_id) {
     return absl::StrCat(std::string(1, kSuitNames[suit]), "x", ws);
   }
   return absl::StrCat(std::string(1, kSuitNames[suit]),
-                       ws - kNumContracts + 1);
+                       ws - kNumContracts + 2);
 }
 
 // ---- Observer ----
@@ -319,8 +319,6 @@ class LostCitiesObserver : public Observer {
       {
         auto out = allocator->Get("unknown_per_suit", {kNumSuits});
         for (int s = 0; s < kNumSuits; ++s) {
-          int known = static_cast<int>(state.hands_[player].size());
-          // Count hand cards in this suit specifically.
           int hand_in_suit = 0;
           for (int c : state.hands_[player]) {
             if (SuitOf(c) == s) ++hand_in_suit;

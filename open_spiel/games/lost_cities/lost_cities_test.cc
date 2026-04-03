@@ -76,10 +76,10 @@ void ActionEncodingTest() {
   SPIEL_CHECK_EQ(state->ActionToString(kChancePlayerId, 0), "Deal:bx0");
   SPIEL_CHECK_EQ(state->ActionToString(kChancePlayerId, 12), "Deal:gx0");
 
-  // Play card 5 (within_suit=5, name=b3): action = 5*2 = 10.
-  SPIEL_CHECK_EQ(state->ActionToString(0, 10), "play:b3");
+  // Play card 5 (within_suit=5, face_value=4): action = 5*2 = 10.
+  SPIEL_CHECK_EQ(state->ActionToString(0, 10), "play:b4");
   // Discard card 5: action = 5*2+1 = 11.
-  SPIEL_CHECK_EQ(state->ActionToString(0, 11), "discard:b3");
+  SPIEL_CHECK_EQ(state->ActionToString(0, 11), "discard:b4");
 
   // Draw from deck.
   SPIEL_CHECK_EQ(state->ActionToString(0, kDrawDeckAction), "draw:deck");

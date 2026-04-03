@@ -65,7 +65,7 @@ def _card_name(card_id):
   ws = _within_suit(card_id)
   if ws < _NUM_CONTRACTS:
     return f"{suit}x{ws}"
-  return f"{suit}{ws - _NUM_CONTRACTS + 1}"
+  return f"{suit}{ws - _NUM_CONTRACTS + 2}"
 
 
 def _card_name_to_id(name):
@@ -77,7 +77,7 @@ def _card_name_to_id(name):
     ws = int(name[2:])
   else:
     # Number: e.g. "b1" -> within_suit = 3, "b9" -> within_suit = 11
-    ws = int(name[1:]) + _NUM_CONTRACTS - 1
+    ws = int(name[1:]) + _NUM_CONTRACTS - 2
   return suit * _CARDS_PER_SUIT + ws
 
 

@@ -60,17 +60,17 @@ class CardNameMappingTest(absltest.TestCase):
   def test_specific_cards(self):
     self.assertEqual(lost_cities_committer._card_name_to_id("bx0"), 0)
     self.assertEqual(lost_cities_committer._card_name_to_id("bx2"), 2)
-    self.assertEqual(lost_cities_committer._card_name_to_id("b1"), 3)
-    self.assertEqual(lost_cities_committer._card_name_to_id("b9"), 11)
-    self.assertEqual(lost_cities_committer._card_name_to_id("g1"), 15)
-    self.assertEqual(lost_cities_committer._card_name_to_id("y9"), 71)
+    self.assertEqual(lost_cities_committer._card_name_to_id("b2"), 3)
+    self.assertEqual(lost_cities_committer._card_name_to_id("b10"), 11)
+    self.assertEqual(lost_cities_committer._card_name_to_id("g2"), 15)
+    self.assertEqual(lost_cities_committer._card_name_to_id("y10"), 71)
 
 
 class ParseObservationTest(absltest.TestCase):
   """Test observation string parsing."""
 
   def test_initial_state(self):
-    obs = "p0 hand:[bx1,b1,b8,gx2,px2,r5,w2,w8] deck:56 phase:PLAY_DISCARD"
+    obs = "p0 hand:[bx1,b2,b9,gx2,px2,r6,w3,w9] deck:56 phase:PLAY_DISCARD"
     parsed = lost_cities_committer._parse_observation(obs)
     self.assertEqual(len(parsed["hand"]), 8)
     self.assertEqual(parsed["deck_size"], 56)
@@ -79,8 +79,8 @@ class ParseObservationTest(absltest.TestCase):
     self.assertEqual(parsed["discards"], {})
 
   def test_with_expeditions_and_discards(self):
-    obs = ("p0 hand:[b1,g4] p0_b:[bx0,b3] p1_g:[gx1,g4] "
-           "d_r:[r2,r5] deck:42 phase:PLAY_DISCARD")
+    obs = ("p0 hand:[b2,g5] p0_b:[bx0,b4] p1_g:[gx1,g5] "
+           "d_r:[r3,r6] deck:42 phase:PLAY_DISCARD")
     parsed = lost_cities_committer._parse_observation(obs)
     self.assertEqual(len(parsed["hand"]), 2)
     self.assertIn((0, 0), parsed["expeditions"])  # p0, suit b
@@ -179,7 +179,7 @@ class MinimizeGapTest(absltest.TestCase):
     """With empty expedition, lowest card has smallest gap."""
     # Two cards in same suit: contract (ws=0) and number (ws=5)
     # Contract has gap 0, number has gap > 0
-    candidates = [0, 5]  # bx0 (ws=0) and b3 (ws=5)
+    candidates = [0, 5]  # bx0 (ws=0) and b4 (ws=5)
     expeditions = {}
     discards = {}
     best, gap, _ = lost_cities_committer._minimize_gap(
@@ -189,7 +189,7 @@ class MinimizeGapTest(absltest.TestCase):
 
   def test_gap_accounts_for_removed_cards(self):
     """Cards that are removed shouldn't count toward the gap."""
-    # Suit b: expedition has bx0 (ws=0). Candidate: b3 (ws=5, card_id=5).
+    # Suit b: expedition has bx0 (ws=0). Candidate: b4 (ws=5, card_id=5).
     # Normally gap would count ws 1,2,3,4 = 4 available indices.
     # But if ws=1 and ws=2 are in opponent expedition and ws=3 is discarded
     # (not top), gap should decrease.
@@ -197,8 +197,8 @@ class MinimizeGapTest(absltest.TestCase):
         (0, 0): [0],   # player 0 played bx0
         (1, 0): [1, 2],  # opponent played bx1, bx2 (ws=1, ws=2)
     }
-    discards = {0: [3, 4]}  # b1(ws=3) buried, b2(ws=4) is top (drawable)
-    candidates = [5]  # b3 (ws=5)
+    discards = {0: [3, 4]}  # b2(ws=3) buried, b3(ws=4) is top (drawable)
+    candidates = [5]  # b4 (ws=5)
     best, gap, _ = lost_cities_committer._minimize_gap(
         candidates, expeditions, discards, 0)
     # ws=1,2 removed (opponent expedition), ws=3 removed (buried discard)
