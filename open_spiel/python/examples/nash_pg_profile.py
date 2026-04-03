@@ -39,6 +39,8 @@ flags.DEFINE_integer("num_envs", 16, "Number of parallel environments.")
 flags.DEFINE_integer("num_steps", 128, "Steps per rollout.")
 flags.DEFINE_integer("num_updates", 10, "Number of updates to profile.")
 flags.DEFINE_string("game", "lost_cities", "Game to profile.")
+flags.DEFINE_string("hidden_layers_sizes", "128,128",
+                    "Comma-separated hidden layer sizes (e.g. '64,64').")
 
 
 def main(unused_argv):
@@ -54,12 +56,12 @@ def main(unused_argv):
       num_actions=num_actions,
       num_envs=FLAGS.num_envs,
       steps_per_batch=FLAGS.num_steps,
-      hidden_layers_sizes=(128, 128),
+      hidden_layers_sizes=tuple(int(x) for x in FLAGS.hidden_layers_sizes.split(",")),
   )
 
-  logging.info("Game: %s | num_envs: %d | num_steps: %d | batch_size: %d",
+  logging.info("Game: %s | num_envs: %d | num_steps: %d | batch_size: %d | net: %s",
                FLAGS.game, FLAGS.num_envs, FLAGS.num_steps,
-               FLAGS.num_envs * FLAGS.num_steps)
+               FLAGS.num_envs * FLAGS.num_steps, FLAGS.hidden_layers_sizes)
 
   # Warmup
   time_steps = envs.reset()
