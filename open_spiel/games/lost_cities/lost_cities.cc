@@ -47,7 +47,8 @@ const GameType kGameType{
     /*provides_information_state_tensor=*/true,
     /*provides_observation_string=*/true,
     /*provides_observation_tensor=*/true,
-    /*parameter_specification=*/{}};
+    /*parameter_specification=*/
+    {{"enriched_obs", GameParameter(true)}}};
 
 std::shared_ptr<const Game> Factory(const GameParameters& params) {
   return std::shared_ptr<const Game>(new LostCitiesGame(params));
@@ -83,9 +84,10 @@ std::string CardName(int card_id) {
 
 class LostCitiesObserver : public Observer {
  public:
-  explicit LostCitiesObserver(IIGObservationType iig_obs_type)
+  LostCitiesObserver(IIGObservationType iig_obs_type, bool enriched_obs)
       : Observer(/*has_string=*/true, /*has_tensor=*/true),
-        iig_obs_type_(iig_obs_type) {}
+        iig_obs_type_(iig_obs_type),
+        enriched_obs_(enriched_obs) {}
 
   void WriteTensor(const State& observed_state, int player,
                    Allocator* allocator) const override {
@@ -94,12 +96,21 @@ class LostCitiesObserver : public Observer {
     SPIEL_CHECK_GE(player, 0);
     SPIEL_CHECK_LT(player, kNumPlayers);
 
-    // Player indicator (one-hot).
+    // Player indicator (one-hot) — same in both modes.
     {
       auto out = allocator->Get("player", {kNumPlayers});
       out.at(player) = 1;
     }
 
+    if (enriched_obs_) {
+      WriteEnrichedTensor(state, player, allocator);
+    } else {
+      WriteBaseTensor(state, player, allocator);
+    }
+  }
+
+  void WriteBaseTensor(const LostCitiesState& state, int player,
+                       Allocator* allocator) const {
     // Private hand.
     if (iig_obs_type_.private_info == PrivateInfoType::kSinglePlayer) {
       auto out = allocator->Get("private_hand", {kTotalCards});
@@ -110,7 +121,6 @@ class LostCitiesObserver : public Observer {
 
     // Public information.
     if (iig_obs_type_.public_info) {
-      // Expeditions: [num_players, num_suits, cards_per_suit].
       {
         auto out = allocator->Get("expeditions",
                                   {kNumPlayers, kNumSuits, kCardsPerSuit});
@@ -122,14 +132,78 @@ class LostCitiesObserver : public Observer {
           }
         }
       }
-
-      // Discard piles: [num_suits, cards_per_suit].
       {
         auto out =
             allocator->Get("discard_piles", {kNumSuits, kCardsPerSuit});
         for (int s = 0; s < kNumSuits; ++s) {
           for (int card : state.discard_piles_[s]) {
             out.at(s, WithinSuit(card)) = 1;
+          }
+        }
+      }
+      {
+        auto out = allocator->Get("deck_size", {1});
+        out.at(0) =
+            static_cast<float>(state.deck_.size()) / kTotalCards;
+      }
+      {
+        auto out = allocator->Get("phase", {4});
+        out.at(static_cast<int>(state.phase_)) = 1;
+      }
+    }
+  }
+
+  void WriteEnrichedTensor(const LostCitiesState& state, int player,
+                           Allocator* allocator) const {
+    int opp = 1 - player;
+
+    // Card location tensor: [num_suits, cards_per_suit, 5].
+    // Locations: 0=my_hand, 1=my_expedition, 2=opp_expedition,
+    //            3=discard, 4=unknown.
+    if (iig_obs_type_.private_info == PrivateInfoType::kSinglePlayer ||
+        iig_obs_type_.public_info) {
+      auto out = allocator->Get("card_locations",
+                                {kNumSuits, kCardsPerSuit, kNumCardLocations});
+      // Default all to "unknown" (index 4).
+      for (int c = 0; c < kTotalCards; ++c) {
+        out.at(SuitOf(c), WithinSuit(c), 4) = 1;
+      }
+      // Overwrite known locations.
+      if (iig_obs_type_.private_info == PrivateInfoType::kSinglePlayer) {
+        for (int c : state.hands_[player]) {
+          out.at(SuitOf(c), WithinSuit(c), 4) = 0;
+          out.at(SuitOf(c), WithinSuit(c), 0) = 1;  // my_hand
+        }
+      }
+      if (iig_obs_type_.public_info) {
+        for (int s = 0; s < kNumSuits; ++s) {
+          for (int c : state.expeditions_[player][s]) {
+            out.at(SuitOf(c), WithinSuit(c), 4) = 0;
+            out.at(SuitOf(c), WithinSuit(c), 1) = 1;  // my_expedition
+          }
+          for (int c : state.expeditions_[opp][s]) {
+            out.at(SuitOf(c), WithinSuit(c), 4) = 0;
+            out.at(SuitOf(c), WithinSuit(c), 2) = 1;  // opp_expedition
+          }
+          for (int c : state.discard_piles_[s]) {
+            out.at(SuitOf(c), WithinSuit(c), 4) = 0;
+            out.at(SuitOf(c), WithinSuit(c), 3) = 1;  // discard
+          }
+        }
+      }
+    }
+
+    if (iig_obs_type_.public_info) {
+      // Discard pile order: [num_suits, cards_per_suit] normalized face values.
+      {
+        auto out = allocator->Get("discard_order",
+                                  {kNumSuits, kCardsPerSuit});
+        for (int s = 0; s < kNumSuits; ++s) {
+          for (int i = 0;
+               i < static_cast<int>(state.discard_piles_[s].size()); ++i) {
+            out.at(s, i) =
+                static_cast<float>(FaceValue(state.discard_piles_[s][i]))
+                / 10.0f;
           }
         }
       }
@@ -145,6 +219,122 @@ class LostCitiesObserver : public Observer {
       {
         auto out = allocator->Get("phase", {4});
         out.at(static_cast<int>(state.phase_)) = 1;
+      }
+
+      // Per-player, per-suit derived features.
+      // Player order: [me, opponent] for player-relative encoding.
+      int players[2] = {player, opp};
+
+      // wager_count: (2, 6), normalized by 3.
+      {
+        auto out = allocator->Get("wager_count",
+                                  {kNumPlayers, kNumSuits});
+        for (int pi = 0; pi < kNumPlayers; ++pi) {
+          for (int s = 0; s < kNumSuits; ++s) {
+            int wagers = 0;
+            for (int c : state.expeditions_[players[pi]][s]) {
+              if (IsContract(c)) ++wagers;
+            }
+            out.at(pi, s) = static_cast<float>(wagers) / 3.0f;
+          }
+        }
+      }
+
+      // face_sum: (2, 6), normalized by 54.
+      {
+        auto out = allocator->Get("face_sum",
+                                  {kNumPlayers, kNumSuits});
+        for (int pi = 0; pi < kNumPlayers; ++pi) {
+          for (int s = 0; s < kNumSuits; ++s) {
+            int fsum = 0;
+            for (int c : state.expeditions_[players[pi]][s]) {
+              fsum += FaceValue(c);
+            }
+            out.at(pi, s) = static_cast<float>(fsum) / 54.0f;
+          }
+        }
+      }
+
+      // expedition_score: (2, 6), mapped (score+80)/236 to [0,1].
+      {
+        auto out = allocator->Get("expedition_score",
+                                  {kNumPlayers, kNumSuits});
+        for (int pi = 0; pi < kNumPlayers; ++pi) {
+          for (int s = 0; s < kNumSuits; ++s) {
+            double score = state.ScoreExpedition(players[pi], s);
+            out.at(pi, s) = static_cast<float>((score + 80.0) / 236.0);
+          }
+        }
+      }
+
+      // expedition_started: (2, 6), binary.
+      {
+        auto out = allocator->Get("expedition_started",
+                                  {kNumPlayers, kNumSuits});
+        for (int pi = 0; pi < kNumPlayers; ++pi) {
+          for (int s = 0; s < kNumSuits; ++s) {
+            out.at(pi, s) =
+                state.expeditions_[players[pi]][s].empty() ? 0.0f : 1.0f;
+          }
+        }
+      }
+
+      // min_playable_number: (2, 6), normalized by 10.
+      // 0 if expedition not started; otherwise the minimum face value
+      // that can legally be played (top card face value, or 2 if only
+      // wagers are down).
+      {
+        auto out = allocator->Get("min_playable_number",
+                                  {kNumPlayers, kNumSuits});
+        for (int pi = 0; pi < kNumPlayers; ++pi) {
+          for (int s = 0; s < kNumSuits; ++s) {
+            const auto& cards = state.expeditions_[players[pi]][s];
+            if (cards.empty()) {
+              out.at(pi, s) = 0.0f;
+            } else {
+              int top_face = FaceValue(cards.back());
+              // If top card is a contract (face=0), min playable is 2.
+              int min_val = (top_face == 0) ? 2 : top_face;
+              out.at(pi, s) = static_cast<float>(min_val) / 10.0f;
+            }
+          }
+        }
+      }
+
+      // cards_per_expedition: (2, 6), normalized by 12.
+      {
+        auto out = allocator->Get("cards_per_expedition",
+                                  {kNumPlayers, kNumSuits});
+        for (int pi = 0; pi < kNumPlayers; ++pi) {
+          for (int s = 0; s < kNumSuits; ++s) {
+            out.at(pi, s) =
+                static_cast<float>(
+                    state.expeditions_[players[pi]][s].size()) / 12.0f;
+          }
+        }
+      }
+
+      // unknown_per_suit: (6,), normalized by 12.
+      // Cards whose location is not visible to the observing player.
+      {
+        auto out = allocator->Get("unknown_per_suit", {kNumSuits});
+        for (int s = 0; s < kNumSuits; ++s) {
+          int known = static_cast<int>(state.hands_[player].size());
+          // Count hand cards in this suit specifically.
+          int hand_in_suit = 0;
+          for (int c : state.hands_[player]) {
+            if (SuitOf(c) == s) ++hand_in_suit;
+          }
+          int exp_me = static_cast<int>(
+              state.expeditions_[player][s].size());
+          int exp_opp = static_cast<int>(
+              state.expeditions_[opp][s].size());
+          int disc = static_cast<int>(
+              state.discard_piles_[s].size());
+          int unknown = kCardsPerSuit - hand_in_suit - exp_me
+                        - exp_opp - disc;
+          out.at(s) = static_cast<float>(unknown) / 12.0f;
+        }
       }
     }
   }
@@ -219,6 +409,7 @@ class LostCitiesObserver : public Observer {
 
  private:
   IIGObservationType iig_obs_type_;
+  bool enriched_obs_;
 
   // Allow access to private state members.
   friend class LostCitiesState;
@@ -512,10 +703,12 @@ std::unique_ptr<State> LostCitiesState::Clone() const {
 // ---- Game ----
 
 LostCitiesGame::LostCitiesGame(const GameParameters& params)
-    : Game(kGameType, params) {
-  default_observer_ = std::make_shared<LostCitiesObserver>(kDefaultObsType);
+    : Game(kGameType, params),
+      enriched_obs_(ParameterValue<bool>("enriched_obs")) {
+  default_observer_ =
+      std::make_shared<LostCitiesObserver>(kDefaultObsType, enriched_obs_);
   info_state_observer_ =
-      std::make_shared<LostCitiesObserver>(kInfoStateObsType);
+      std::make_shared<LostCitiesObserver>(kInfoStateObsType, enriched_obs_);
 }
 
 std::unique_ptr<State> LostCitiesGame::NewInitialState() const {
@@ -528,7 +721,7 @@ std::shared_ptr<Observer> LostCitiesGame::MakeObserver(
     const GameParameters& params) const {
   if (!params.empty()) SpielFatalError("Observation params not supported");
   return std::make_shared<LostCitiesObserver>(
-      iig_obs_type.value_or(kDefaultObsType));
+      iig_obs_type.value_or(kDefaultObsType), enriched_obs_);
 }
 
 }  // namespace lost_cities

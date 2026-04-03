@@ -60,7 +60,7 @@ class NashPGTest(unittest.TestCase):
         agent.update_magnetic_reference()
 
     # Verify losses are finite
-    pg_loss, v_loss, mag_loss = agent.loss
+    pg_loss, v_loss, mag_loss, _ = agent.loss
     self.assertIsNotNone(pg_loss)
     self.assertTrue(np.isfinite(pg_loss), f"pg_loss not finite: {pg_loss}")
     self.assertTrue(np.isfinite(v_loss), f"v_loss not finite: {v_loss}")
@@ -95,7 +95,7 @@ class NashPGTest(unittest.TestCase):
         agent.post_step(rewards, dones)
       agent.learn(time_steps)
 
-    pg_loss, v_loss, mag_loss = agent.loss
+    pg_loss, v_loss, mag_loss, _ = agent.loss
     self.assertIsNotNone(pg_loss)
     self.assertTrue(np.isfinite(pg_loss))
 
@@ -172,6 +172,68 @@ class NashPGTest(unittest.TestCase):
     for k, v in agent._network.state_dict().items():
       self.assertTrue(torch.allclose(v, initial_weights[k]),
                       f"Weight {k} changed during evaluation")
+
+
+  def test_asymmetric_actor_critic(self):
+    """Test that separate actor/critic sizes produce different-sized networks."""
+    num_envs = 4
+    num_steps = 32
+    envs = SyncVectorEnv([
+        rl_environment.Environment("kuhn_poker")
+        for _ in range(num_envs)
+    ])
+    info_state_size = envs.observation_spec()["info_state"][0]
+    num_actions = envs.envs[0].action_spec()["num_actions"]
+
+    agent = nash_pg.NashPGAgent(
+        info_state_size=info_state_size,
+        num_actions=num_actions,
+        num_envs=num_envs,
+        steps_per_batch=num_steps,
+        actor_hidden_layers_sizes=(16, 16),
+        critic_hidden_layers_sizes=(32, 32, 32),
+        update_epochs=2,
+        num_minibatches=2,
+    )
+
+    # Verify actor and critic have different parameter counts.
+    actor_params = sum(p.numel() for p in agent._network.actor.parameters())
+    critic_params = sum(p.numel() for p in agent._network.critic.parameters())
+    self.assertNotEqual(actor_params, critic_params)
+
+    # Smoke test: run a few updates.
+    time_steps = envs.reset()
+    for _ in range(3):
+      for _ in range(num_steps):
+        agent_output = agent.step(time_steps)
+        time_steps, rewards, dones, _ = envs.step(
+            agent_output, reset_if_done=True)
+        agent.post_step(rewards, dones)
+      agent.learn(time_steps)
+
+    pg_loss, v_loss, mag_loss, _ = agent.loss
+    self.assertTrue(np.isfinite(pg_loss))
+    self.assertTrue(np.isfinite(v_loss))
+
+  def test_hidden_layers_sizes_backward_compat(self):
+    """hidden_layers_sizes still works when actor/critic sizes not specified."""
+    agent = nash_pg.NashPGAgent(
+        info_state_size=11,
+        num_actions=2,
+        num_envs=2,
+        steps_per_batch=8,
+        hidden_layers_sizes=(32, 32),
+    )
+    # Both actor and critic should have 32-wide hidden layers.
+    # Actor: Linear(11,32) + Linear(32,32) + Linear(32,2) = 3 linear layers
+    actor_linears = [m for m in agent._network.actor if isinstance(m, torch.nn.Linear)]
+    self.assertEqual(len(actor_linears), 3)
+    self.assertEqual(actor_linears[0].in_features, 11)
+    self.assertEqual(actor_linears[0].out_features, 32)
+
+    critic_linears = [m for m in agent._network.critic if isinstance(m, torch.nn.Linear)]
+    self.assertEqual(len(critic_linears), 3)
+    self.assertEqual(critic_linears[0].out_features, 32)
 
 
 if __name__ == "__main__":

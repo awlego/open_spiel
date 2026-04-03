@@ -59,7 +59,7 @@ inline constexpr int kDrawDeckAction = kDrawActionOffset;    // 144
 inline constexpr int kNumDistinctActions =
     kDrawActionOffset + 1 + kNumSuits;                       // 151
 
-// Observation tensor layout:
+// Base observation tensor layout (enriched_obs=false):
 //   player:        2  (one-hot)
 //   private_hand: 72  (binary)
 //   expeditions: 144  (2 * 6 * 12)
@@ -67,7 +67,27 @@ inline constexpr int kNumDistinctActions =
 //   deck_size:     1  (normalized)
 //   phase:         4  (one-hot)
 //   Total:       295
-inline constexpr int kObsTensorSize = 2 + 72 + 144 + 72 + 1 + 4;  // 295
+inline constexpr int kBaseObsTensorSize = 2 + 72 + 144 + 72 + 1 + 4;  // 295
+
+// Enriched observation tensor layout (enriched_obs=true, default):
+//   player:              2  (one-hot)
+//   card_locations:    360  (6 suits * 12 cards * 5 locations, one-hot)
+//   discard_order:      72  (6 suits * 12 slots, normalized face values)
+//   deck_size:           1  (normalized)
+//   phase:               4  (one-hot)
+//   wager_count:        12  (2 players * 6 suits, /3)
+//   face_sum:           12  (2 players * 6 suits, /54)
+//   expedition_score:   12  (2 players * 6 suits, (s+80)/236)
+//   expedition_started: 12  (2 players * 6 suits, binary)
+//   min_playable_number:12  (2 players * 6 suits, /10)
+//   cards_per_expedition:12 (2 players * 6 suits, /12)
+//   unknown_per_suit:    6  (6 suits, /12)
+//   Total:             517
+inline constexpr int kEnrichedObsTensorSize =
+    2 + 360 + 72 + 1 + 4 + 12 + 12 + 12 + 12 + 12 + 12 + 6;  // 517
+
+// Number of card location categories in enriched mode.
+inline constexpr int kNumCardLocations = 5;
 
 inline constexpr int kMaxGameLength = 10000;
 
@@ -157,15 +177,16 @@ class LostCitiesGame : public Game {
   absl::optional<double> UtilitySum() const override { return 0.0; }
   int MaxGameLength() const override { return kMaxGameLength; }
   std::vector<int> InformationStateTensorShape() const override {
-    return {kObsTensorSize};
+    return {enriched_obs_ ? kEnrichedObsTensorSize : kBaseObsTensorSize};
   }
   std::vector<int> ObservationTensorShape() const override {
-    return {kObsTensorSize};
+    return {enriched_obs_ ? kEnrichedObsTensorSize : kBaseObsTensorSize};
   }
   std::shared_ptr<Observer> MakeObserver(
       absl::optional<IIGObservationType> iig_obs_type,
       const GameParameters& params) const override;
 
+  bool enriched_obs_;
   std::shared_ptr<Observer> default_observer_;
   std::shared_ptr<Observer> info_state_observer_;
 };

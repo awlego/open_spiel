@@ -55,14 +55,16 @@ INVALID_ACTION_PENALTY = -1e6
 class NashPGNetwork(nn.Module):
   """Separate actor-critic network for NashPG."""
 
-  def __init__(self, info_state_size, num_actions, hidden_layers_sizes=(128, 128)):
+  def __init__(self, info_state_size, num_actions,
+               actor_hidden_layers_sizes=(128, 128),
+               critic_hidden_layers_sizes=(128, 128)):
     super().__init__()
     self.num_actions = num_actions
 
     # Build actor
     actor_layers = []
     in_size = info_state_size
-    for h in hidden_layers_sizes:
+    for h in actor_hidden_layers_sizes:
       actor_layers.append(layer_init(nn.Linear(in_size, h)))
       actor_layers.append(nn.ReLU())
       in_size = h
@@ -72,7 +74,7 @@ class NashPGNetwork(nn.Module):
     # Build critic
     critic_layers = []
     in_size = info_state_size
-    for h in hidden_layers_sizes:
+    for h in critic_hidden_layers_sizes:
       critic_layers.append(layer_init(nn.Linear(in_size, h)))
       critic_layers.append(nn.ReLU())
       in_size = h
@@ -122,6 +124,8 @@ class NashPGAgent:
                num_envs,
                steps_per_batch,
                hidden_layers_sizes=(128, 128),
+               actor_hidden_layers_sizes=None,
+               critic_hidden_layers_sizes=None,
                learning_rate=3e-4,
                entropy_cost=0.05,
                magnetic_cost=0.2,
@@ -142,8 +146,12 @@ class NashPGAgent:
       num_actions: int, number of distinct actions.
       num_envs: int, number of parallel environments.
       steps_per_batch: int, number of steps per rollout before learning.
-      hidden_layers_sizes: iterable of ints, hidden layer sizes for actor and
-        critic networks.
+      hidden_layers_sizes: iterable of ints, default hidden layer sizes for
+        both actor and critic (used when actor/critic sizes not specified).
+      actor_hidden_layers_sizes: iterable of ints or None, hidden layer sizes
+        for the actor network. If None, uses hidden_layers_sizes.
+      critic_hidden_layers_sizes: iterable of ints or None, hidden layer sizes
+        for the critic network. If None, uses hidden_layers_sizes.
       learning_rate: float, learning rate for Adam optimizer.
       entropy_cost: float, entropy bonus coefficient.
       magnetic_cost: float, coefficient for KL/L2 regularization toward the
@@ -180,9 +188,14 @@ class NashPGAgent:
     self._batch_size = num_envs * steps_per_batch
     self._minibatch_size = max(1, self._batch_size // num_minibatches)
 
+    # Resolve actor/critic sizes (fall back to shared hidden_layers_sizes).
+    actor_sizes = actor_hidden_layers_sizes or hidden_layers_sizes
+    critic_sizes = critic_hidden_layers_sizes or hidden_layers_sizes
+
     # Networks
     self._network = NashPGNetwork(
-        info_state_size, num_actions, hidden_layers_sizes).to(self._device)
+        info_state_size, num_actions, actor_sizes, critic_sizes
+    ).to(self._device)
     self._magnetic_network = copy.deepcopy(self._network).to(self._device)
     self._magnetic_network.eval()
     for p in self._magnetic_network.parameters():

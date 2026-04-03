@@ -121,6 +121,7 @@ _GAME_TYPE = pyspiel.GameType(
     provides_observation_string=True,
     provides_observation_tensor=True,
     provides_factored_observation_string=True,
+    parameter_specification={"enriched_obs": True},
 )
 
 _GAME_INFO = pyspiel.GameInfo(
@@ -141,6 +142,7 @@ class LostCitiesGame(pyspiel.Game):
 
   def __init__(self, params=None):
     super().__init__(_GAME_TYPE, _GAME_INFO, params or dict())
+    self._enriched_obs = params.get("enriched_obs", True) if params else True
 
   def new_initial_state(self):
     return LostCitiesState(self)
@@ -148,7 +150,8 @@ class LostCitiesGame(pyspiel.Game):
   def make_py_observer(self, iig_obs_type=None, params=None):
     return LostCitiesObserver(
         iig_obs_type or pyspiel.IIGObservationType(perfect_recall=False),
-        params)
+        params,
+        enriched_obs=self._enriched_obs)
 
 
 # --- State class ---
@@ -347,42 +350,25 @@ class LostCitiesState(pyspiel.State):
 
 # --- Observer class ---
 
+_NUM_CARD_LOCATIONS = 5  # my_hand, my_expedition, opp_expedition, discard, unknown
+
+
 class LostCitiesObserver:
   """Observer for Lost Cities, conforming to the PyObserver interface."""
 
-  # Tensor layout:
-  #   player:       2  (one-hot)
-  #   private_hand: 72 (binary: which cards in hand)
-  #   expeditions:  2 * 6 * 12 = 144 (binary: which cards played)
-  #   discard_piles: 6 * 12 = 72 (binary: which cards in discard)
-  #   deck_size:    1  (normalized 0-1)
-  #   phase:        4  (one-hot)
-
-  _PLAYER_SIZE = _NUM_PLAYERS
-  _HAND_SIZE = _TOTAL_CARDS
-  _EXPEDITION_SIZE = _NUM_PLAYERS * _NUM_SUITS * _CARDS_PER_SUIT
-  _DISCARD_SIZE = _NUM_SUITS * _CARDS_PER_SUIT
-  _DECK_SIZE = 1
-  _PHASE_SIZE = 4
-  _TOTAL_SIZE = (_PLAYER_SIZE + _HAND_SIZE + _EXPEDITION_SIZE +
-                 _DISCARD_SIZE + _DECK_SIZE + _PHASE_SIZE)
-
-  def __init__(self, iig_obs_type, params):
+  def __init__(self, iig_obs_type, params, enriched_obs=True):
     if params:
       raise ValueError(f"Observation parameters not supported; passed {params}")
 
-    pieces = [("player", self._PLAYER_SIZE, (_NUM_PLAYERS,))]
+    self._iig_obs_type = iig_obs_type
+    self._enriched_obs = enriched_obs
 
-    if iig_obs_type.private_info == pyspiel.PrivateInfoType.SINGLE_PLAYER:
-      pieces.append(("private_hand", self._HAND_SIZE, (_TOTAL_CARDS,)))
+    pieces = [("player", _NUM_PLAYERS, (_NUM_PLAYERS,))]
 
-    if iig_obs_type.public_info:
-      pieces.append(("expeditions", self._EXPEDITION_SIZE,
-                      (_NUM_PLAYERS, _NUM_SUITS, _CARDS_PER_SUIT)))
-      pieces.append(("discard_piles", self._DISCARD_SIZE,
-                      (_NUM_SUITS, _CARDS_PER_SUIT)))
-      pieces.append(("deck_size", self._DECK_SIZE, (1,)))
-      pieces.append(("phase", self._PHASE_SIZE, (4,)))
+    if enriched_obs:
+      self._build_enriched_pieces(pieces, iig_obs_type)
+    else:
+      self._build_base_pieces(pieces, iig_obs_type)
 
     total_size = sum(size for _, size, _ in pieces)
     self.tensor = np.zeros(total_size, np.float32)
@@ -393,6 +379,53 @@ class LostCitiesObserver:
       self.dict[name] = self.tensor[index:index + size].reshape(shape)
       index += size
 
+  def _build_base_pieces(self, pieces, iig_obs_type):
+    if iig_obs_type.private_info == pyspiel.PrivateInfoType.SINGLE_PLAYER:
+      pieces.append(("private_hand", _TOTAL_CARDS, (_TOTAL_CARDS,)))
+    if iig_obs_type.public_info:
+      pieces.append(("expeditions",
+                      _NUM_PLAYERS * _NUM_SUITS * _CARDS_PER_SUIT,
+                      (_NUM_PLAYERS, _NUM_SUITS, _CARDS_PER_SUIT)))
+      pieces.append(("discard_piles",
+                      _NUM_SUITS * _CARDS_PER_SUIT,
+                      (_NUM_SUITS, _CARDS_PER_SUIT)))
+      pieces.append(("deck_size", 1, (1,)))
+      pieces.append(("phase", 4, (4,)))
+
+  def _build_enriched_pieces(self, pieces, iig_obs_type):
+    if (iig_obs_type.private_info == pyspiel.PrivateInfoType.SINGLE_PLAYER or
+        iig_obs_type.public_info):
+      pieces.append(("card_locations",
+                      _NUM_SUITS * _CARDS_PER_SUIT * _NUM_CARD_LOCATIONS,
+                      (_NUM_SUITS, _CARDS_PER_SUIT, _NUM_CARD_LOCATIONS)))
+    if iig_obs_type.public_info:
+      pieces.append(("discard_order",
+                      _NUM_SUITS * _CARDS_PER_SUIT,
+                      (_NUM_SUITS, _CARDS_PER_SUIT)))
+      pieces.append(("deck_size", 1, (1,)))
+      pieces.append(("phase", 4, (4,)))
+      pieces.append(("wager_count",
+                      _NUM_PLAYERS * _NUM_SUITS,
+                      (_NUM_PLAYERS, _NUM_SUITS)))
+      pieces.append(("face_sum",
+                      _NUM_PLAYERS * _NUM_SUITS,
+                      (_NUM_PLAYERS, _NUM_SUITS)))
+      pieces.append(("expedition_score",
+                      _NUM_PLAYERS * _NUM_SUITS,
+                      (_NUM_PLAYERS, _NUM_SUITS)))
+      pieces.append(("expedition_started",
+                      _NUM_PLAYERS * _NUM_SUITS,
+                      (_NUM_PLAYERS, _NUM_SUITS)))
+      pieces.append(("min_playable_number",
+                      _NUM_PLAYERS * _NUM_SUITS,
+                      (_NUM_PLAYERS, _NUM_SUITS)))
+      pieces.append(("cards_per_expedition",
+                      _NUM_PLAYERS * _NUM_SUITS,
+                      (_NUM_PLAYERS, _NUM_SUITS)))
+      pieces.append(("unknown_per_suit",
+                      _NUM_SUITS,
+                      (_NUM_SUITS,)))
+
   def set_from(self, state, player):
     """Updates tensor and dict to reflect state from player's PoV."""
     self.tensor.fill(0)
@@ -400,6 +433,12 @@ class LostCitiesObserver:
     if "player" in self.dict:
       self.dict["player"][player] = 1
 
+    if self._enriched_obs:
+      self._set_enriched(state, player)
+    else:
+      self._set_base(state, player)
+
+  def _set_base(self, state, player):
     if "private_hand" in self.dict:
       for card_id in state._hands[player]:
         self.dict["private_hand"][card_id] = 1
@@ -421,15 +460,107 @@ class LostCitiesObserver:
     if "phase" in self.dict:
       self.dict["phase"][int(state._phase)] = 1
 
+  def _set_enriched(self, state, player):
+    opp = 1 - player
+
+    # Card locations: default to unknown (index 4), then overwrite.
+    if "card_locations" in self.dict:
+      cl = self.dict["card_locations"]
+      cl[:, :, 4] = 1  # default: unknown
+
+      if self._iig_obs_type.private_info == pyspiel.PrivateInfoType.SINGLE_PLAYER:
+        for c in state._hands[player]:
+          cl[_suit_of(c), _within_suit(c), 4] = 0
+          cl[_suit_of(c), _within_suit(c), 0] = 1  # my_hand
+
+      if self._iig_obs_type.public_info:
+        for s in range(_NUM_SUITS):
+          for c in state._expeditions[player][s]:
+            cl[_suit_of(c), _within_suit(c), 4] = 0
+            cl[_suit_of(c), _within_suit(c), 1] = 1  # my_expedition
+          for c in state._expeditions[opp][s]:
+            cl[_suit_of(c), _within_suit(c), 4] = 0
+            cl[_suit_of(c), _within_suit(c), 2] = 1  # opp_expedition
+          for c in state._discard_piles[s]:
+            cl[_suit_of(c), _within_suit(c), 4] = 0
+            cl[_suit_of(c), _within_suit(c), 3] = 1  # discard
+
+    if self._iig_obs_type.public_info:
+      # Discard pile order: normalized face values, bottom-first.
+      if "discard_order" in self.dict:
+        for s in range(_NUM_SUITS):
+          for i, c in enumerate(state._discard_piles[s]):
+            self.dict["discard_order"][s, i] = _face_value(c) / 10.0
+
+      if "deck_size" in self.dict:
+        self.dict["deck_size"][0] = len(state._deck) / _TOTAL_CARDS
+
+      if "phase" in self.dict:
+        self.dict["phase"][int(state._phase)] = 1
+
+      # Player-relative order: [me, opponent].
+      players = [player, opp]
+
+      if "wager_count" in self.dict:
+        for pi, p in enumerate(players):
+          for s in range(_NUM_SUITS):
+            wagers = sum(1 for c in state._expeditions[p][s] if _is_contract(c))
+            self.dict["wager_count"][pi, s] = wagers / 3.0
+
+      if "face_sum" in self.dict:
+        for pi, p in enumerate(players):
+          for s in range(_NUM_SUITS):
+            fsum = sum(_face_value(c) for c in state._expeditions[p][s])
+            self.dict["face_sum"][pi, s] = fsum / 54.0
+
+      if "expedition_score" in self.dict:
+        for pi, p in enumerate(players):
+          for s in range(_NUM_SUITS):
+            score = state._score_expedition(p, s)
+            self.dict["expedition_score"][pi, s] = (score + 80.0) / 236.0
+
+      if "expedition_started" in self.dict:
+        for pi, p in enumerate(players):
+          for s in range(_NUM_SUITS):
+            self.dict["expedition_started"][pi, s] = (
+                0.0 if not state._expeditions[p][s] else 1.0)
+
+      if "min_playable_number" in self.dict:
+        for pi, p in enumerate(players):
+          for s in range(_NUM_SUITS):
+            cards = state._expeditions[p][s]
+            if not cards:
+              self.dict["min_playable_number"][pi, s] = 0.0
+            else:
+              top_face = _face_value(cards[-1])
+              min_val = 2 if top_face == 0 else top_face
+              self.dict["min_playable_number"][pi, s] = min_val / 10.0
+
+      if "cards_per_expedition" in self.dict:
+        for pi, p in enumerate(players):
+          for s in range(_NUM_SUITS):
+            self.dict["cards_per_expedition"][pi, s] = (
+                len(state._expeditions[p][s]) / 12.0)
+
+      if "unknown_per_suit" in self.dict:
+        for s in range(_NUM_SUITS):
+          hand_in_suit = sum(1 for c in state._hands[player]
+                             if _suit_of(c) == s)
+          exp_me = len(state._expeditions[player][s])
+          exp_opp = len(state._expeditions[opp][s])
+          disc = len(state._discard_piles[s])
+          unknown = _CARDS_PER_SUIT - hand_in_suit - exp_me - exp_opp - disc
+          self.dict["unknown_per_suit"][s] = unknown / 12.0
+
   def string_from(self, state, player):
     """Observation as a string from player's PoV."""
     pieces = []
     if "player" in self.dict:
       pieces.append(f"p{player}")
-    if "private_hand" in self.dict:
+    if "private_hand" in self.dict or "card_locations" in self.dict:
       hand = sorted(state._hands[player], key=_card_sort_key)
       pieces.append(f"hand:[{','.join(_card_name(c) for c in hand)}]")
-    if "expeditions" in self.dict:
+    if ("expeditions" in self.dict or "card_locations" in self.dict):
       for p in range(_NUM_PLAYERS):
         for suit in range(_NUM_SUITS):
           exp = state._expeditions[p][suit]

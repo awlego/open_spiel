@@ -88,15 +88,16 @@ void ActionEncodingTest() {
                  "draw:b_pile");
 }
 
-void ObservationTensorTest() {
+void ObservationTensorTestEnriched() {
+  // Default: enriched_obs=true -> 517-dim tensor.
   auto game = LoadGame("lost_cities");
   auto state = game->NewInitialState();
 
-  // Verify observation tensor shape.
-  SPIEL_CHECK_EQ(game->ObservationTensorShape()[0], kObsTensorSize);
-  SPIEL_CHECK_EQ(game->InformationStateTensorShape()[0], kObsTensorSize);
+  SPIEL_CHECK_EQ(game->ObservationTensorShape()[0], kEnrichedObsTensorSize);
+  SPIEL_CHECK_EQ(game->InformationStateTensorShape()[0],
+                 kEnrichedObsTensorSize);
 
-  // Play through the deal phase with a random sim and check tensor size.
+  // Play through the deal phase.
   std::mt19937 rng(42);
   while (state->IsChanceNode()) {
     auto outcomes = state->ChanceOutcomes();
@@ -104,25 +105,61 @@ void ObservationTensorTest() {
     state->ApplyAction(outcomes[dist(rng)].first);
   }
 
-  // Now in PLAY_DISCARD phase. Check observation tensor.
-  std::vector<float> tensor(kObsTensorSize, -1.0f);
+  int size = game->ObservationTensorShape()[0];
+  std::vector<float> tensor(size, -1.0f);
   state->ObservationTensor(0, absl::MakeSpan(tensor));
 
-  // Player 0 indicator should be set.
+  // Player 0 indicator.
   SPIEL_CHECK_EQ(tensor[0], 1.0f);
   SPIEL_CHECK_EQ(tensor[1], 0.0f);
 
-  // Phase should be PLAY_DISCARD (index 1).
+  // Verify card_locations are valid one-hot: for each of 72 cards,
+  // exactly one of the 5 location bits should be 1.
+  int card_loc_offset = 2;  // after player indicator
+  for (int c = 0; c < kTotalCards; ++c) {
+    float sum = 0;
+    for (int loc = 0; loc < kNumCardLocations; ++loc) {
+      float val = tensor[card_loc_offset + c * kNumCardLocations + loc];
+      SPIEL_CHECK_TRUE(val == 0.0f || val == 1.0f);
+      sum += val;
+    }
+    SPIEL_CHECK_EQ(sum, 1.0f);
+  }
+
+  // Player 1 perspective.
+  std::vector<float> tensor1(size, -1.0f);
+  state->ObservationTensor(1, absl::MakeSpan(tensor1));
+  SPIEL_CHECK_EQ(tensor1[0], 0.0f);
+  SPIEL_CHECK_EQ(tensor1[1], 1.0f);
+}
+
+void ObservationTensorTestBase() {
+  // enriched_obs=false -> 295-dim legacy tensor.
+  auto game = LoadGame("lost_cities(enriched_obs=false)");
+  auto state = game->NewInitialState();
+
+  SPIEL_CHECK_EQ(game->ObservationTensorShape()[0], kBaseObsTensorSize);
+  SPIEL_CHECK_EQ(game->InformationStateTensorShape()[0], kBaseObsTensorSize);
+
+  std::mt19937 rng(42);
+  while (state->IsChanceNode()) {
+    auto outcomes = state->ChanceOutcomes();
+    std::uniform_int_distribution<int> dist(0, outcomes.size() - 1);
+    state->ApplyAction(outcomes[dist(rng)].first);
+  }
+
+  std::vector<float> tensor(kBaseObsTensorSize, -1.0f);
+  state->ObservationTensor(0, absl::MakeSpan(tensor));
+
+  // Player 0 indicator.
+  SPIEL_CHECK_EQ(tensor[0], 1.0f);
+  SPIEL_CHECK_EQ(tensor[1], 0.0f);
+
+  // Phase should be PLAY_DISCARD (index 1) at offset 291.
   SPIEL_CHECK_EQ(tensor[291], 0.0f);  // DEAL
   SPIEL_CHECK_EQ(tensor[292], 1.0f);  // PLAY_DISCARD
   SPIEL_CHECK_EQ(tensor[293], 0.0f);  // DRAW
   SPIEL_CHECK_EQ(tensor[294], 0.0f);  // CHANCE_DRAW
-
-  // Player 1 perspective.
-  std::vector<float> tensor1(kObsTensorSize, -1.0f);
-  state->ObservationTensor(1, absl::MakeSpan(tensor1));
-  SPIEL_CHECK_EQ(tensor1[0], 0.0f);
-  SPIEL_CHECK_EQ(tensor1[1], 1.0f);
 }
 
 }  // namespace
@@ -133,7 +170,8 @@ int main(int argc, char** argv) {
   open_spiel::lost_cities::BasicGameTests();
   open_spiel::lost_cities::ScoringTest();
   open_spiel::lost_cities::ActionEncodingTest();
-  open_spiel::lost_cities::ObservationTensorTest();
+  open_spiel::lost_cities::ObservationTensorTestEnriched();
+  open_spiel::lost_cities::ObservationTensorTestBase();
   std::cout << "All Lost Cities tests passed!" << std::endl;
   return 0;
 }

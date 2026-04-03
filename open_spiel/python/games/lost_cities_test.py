@@ -205,6 +205,71 @@ class LostCitiesGameplayTest(absltest.TestCase):
           self.assertNotIn(play_action, state.legal_actions())
 
 
+class LostCitiesObserverTest(absltest.TestCase):
+  """Test observer tensor layouts."""
+
+  def _deal_state(self, enriched_obs=True):
+    """Create a game and deal cards, returning (game, state)."""
+    game = lost_cities.LostCitiesGame({"enriched_obs": enriched_obs})
+    state = game.new_initial_state()
+    rng = np.random.RandomState(42)
+    for _ in range(16):
+      outcomes = state.chance_outcomes()
+      probs = [p for _, p in outcomes]
+      idx = rng.choice(len(outcomes), p=probs)
+      state.apply_action(outcomes[idx][0])
+    return game, state
+
+  def test_enriched_tensor_size(self):
+    game, state = self._deal_state(enriched_obs=True)
+    obs = game.make_py_observer()
+    obs.set_from(state, 0)
+    self.assertEqual(len(obs.tensor), 517)
+
+  def test_base_tensor_size(self):
+    game, state = self._deal_state(enriched_obs=False)
+    obs = game.make_py_observer()
+    obs.set_from(state, 0)
+    self.assertEqual(len(obs.tensor), 295)
+
+  def test_card_locations_one_hot(self):
+    """Each card should be in exactly one location."""
+    game, state = self._deal_state(enriched_obs=True)
+    obs = game.make_py_observer()
+    obs.set_from(state, 0)
+    cl = obs.dict["card_locations"]  # shape (6, 12, 5)
+    for s in range(6):
+      for c in range(12):
+        self.assertAlmostEqual(cl[s, c, :].sum(), 1.0,
+                               msg=f"Card ({s},{c}) not one-hot: {cl[s,c,:]}")
+
+  def test_enriched_features_after_deal(self):
+    """After deal, all expeditions empty: scores=0, unknown>0."""
+    game, state = self._deal_state(enriched_obs=True)
+    obs = game.make_py_observer()
+    obs.set_from(state, 0)
+    # All expedition scores should map to (0+80)/236 ≈ 0.339 (empty=0 score)
+    np.testing.assert_allclose(obs.dict["expedition_score"],
+                               np.full((2, 6), 80.0 / 236.0))
+    # All expeditions not started
+    np.testing.assert_array_equal(obs.dict["expedition_started"],
+                                  np.zeros((2, 6)))
+    # Unknown per suit should be positive (8 cards in hand, 0 in expeditions)
+    self.assertTrue(np.all(obs.dict["unknown_per_suit"] > 0))
+
+  def test_discard_order_after_discard(self):
+    """After discarding a card, discard_order should reflect it."""
+    game, state = self._deal_state(enriched_obs=True)
+    obs = game.make_py_observer()
+    # Discard the first card in hand
+    card = state._hands[0][0]
+    suit = lost_cities._suit_of(card)
+    state.apply_action(card * 2 + 1)  # discard
+    obs.set_from(state, 0)
+    expected_val = lost_cities._face_value(card) / 10.0
+    self.assertAlmostEqual(obs.dict["discard_order"][suit, 0], expected_val)
+
+
 class LostCitiesRandomSimTest(absltest.TestCase):
   """Random simulation tests."""
 
