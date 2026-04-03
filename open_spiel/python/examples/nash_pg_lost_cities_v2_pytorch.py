@@ -91,6 +91,54 @@ flags.DEFINE_string("logdir", "runs/lost_cities_nash_pg",
                     "TensorBoard log directory.")
 flags.DEFINE_string("checkpoint_dir", "checkpoints/lost_cities_nash_pg",
                     "Directory for saving/resuming checkpoints.")
+flags.DEFINE_string("milestone_checkpoint", "",
+                    "Path to a frozen model checkpoint for eval. "
+                    "If empty, skips model-vs-model evaluation.")
+
+
+class NashPGBot:
+  """Wraps a frozen NashPG checkpoint as a bot for evaluation.
+
+  Loads the actor network from a checkpoint directory and provides a
+  .step(state) interface compatible with _advance_non_agent().
+  """
+
+  def __init__(self, checkpoint_dir, player_id, info_state_size, num_actions):
+    self._player_id = player_id
+    self._info_state_size = info_state_size
+    self._num_actions = num_actions
+
+    # Load config to get architecture.
+    config_path = pathlib.Path(checkpoint_dir) / "config.json"
+    with open(config_path) as f:
+      config = json.load(f)
+
+    hidden = tuple(int(s) for s in config["hidden_layers_sizes"])
+    actor_sizes = (tuple(int(s) for s in config["actor_hidden_layers_sizes"])
+                   if config.get("actor_hidden_layers_sizes") else hidden)
+    critic_sizes = (tuple(int(s) for s in config["critic_hidden_layers_sizes"])
+                    if config.get("critic_hidden_layers_sizes") else hidden)
+
+    self._network = nash_pg.NashPGNetwork(
+        info_state_size, num_actions, actor_sizes, critic_sizes)
+    data = torch.load(
+        pathlib.Path(checkpoint_dir) / "nash_pg.pt", weights_only=True)
+    self._network.load_state_dict(data["network"])
+    self._network.eval()
+
+  def restart_at(self, state):
+    pass
+
+  def step(self, state):
+    obs = np.array(state.information_state_tensor(self._player_id),
+                   dtype=np.float32)
+    legal = state.legal_actions(self._player_id)
+    obs_t = torch.as_tensor(obs).unsqueeze(0)
+    mask = torch.zeros(1, self._num_actions, dtype=torch.bool)
+    mask[0, legal] = True
+    with torch.no_grad():
+      action, _, _, _, _ = self._network.get_action_and_value(obs_t, mask)
+    return action.item()
 
 
 def save_checkpoint(agent, checkpoint_dir, update, outer_step):
@@ -278,6 +326,15 @@ def eval_vs_committer(game, agent, rng, num_games, device="cpu"):
                               make_opponent=make_committer)
 
 
+def eval_vs_model(game, agent, rng, num_games, checkpoint_dir,
+                  info_state_size, num_actions):
+  """Evaluate the agent vs a frozen NashPG model checkpoint."""
+  def make_model_bot(player_id, rng):
+    return NashPGBot(checkpoint_dir, player_id, info_state_size, num_actions)
+  return _run_vectorized_eval(game, agent, rng, num_games,
+                              make_opponent=make_model_bot)
+
+
 def _make_env():
   return rl_environment.Environment("lost_cities", enriched_obs=True)
 
@@ -398,6 +455,19 @@ def main(unused_argv):
       writer.add_scalar("eval/avg_score_vs_committer", c_avg_score,
                          agent.total_steps_done)
 
+      # Evaluate vs milestone model (if configured)
+      m_wr_str = ""
+      if FLAGS.milestone_checkpoint:
+        m_wins, m_avg_score = eval_vs_model(
+            game, agent, eval_rng, FLAGS.eval_games,
+            FLAGS.milestone_checkpoint, info_state_size, num_actions)
+        m_win_rate = m_wins / FLAGS.eval_games
+        writer.add_scalar("eval/win_rate_vs_milestone", m_win_rate,
+                           agent.total_steps_done)
+        writer.add_scalar("eval/avg_score_vs_milestone", m_avg_score,
+                           agent.total_steps_done)
+        m_wr_str = f" vs_mile=%.2f/%.1f" % (m_win_rate, m_avg_score)
+
       writer.add_scalar("perf/steps_per_sec", steps_per_sec,
                          agent.total_steps_done)
 
@@ -407,10 +477,11 @@ def main(unused_argv):
                    ) / 3600 if steps_per_sec > 0 else 0
 
       logging.info(
-          "Update %d | steps=%d | vs_rand=%.2f/%.1f vs_commit=%.2f/%.1f | "
+          "Update %d | steps=%d | vs_rand=%.2f/%.1f vs_commit=%.2f/%.1f%s | "
           "%.0f steps/s | ETA %.1fh | outer_step=%d",
           update + 1, agent.total_steps_done, win_rate, avg_score,
-          c_win_rate, c_avg_score, steps_per_sec, eta_hours, outer_step)
+          c_win_rate, c_avg_score, m_wr_str, steps_per_sec, eta_hours,
+          outer_step)
 
     # Save checkpoints periodically
     if (update + 1) % FLAGS.checkpoint_every == 0:
@@ -434,6 +505,16 @@ def main(unused_argv):
                      c_wins / FLAGS.eval_games, agent.total_steps_done)
   writer.add_scalar("eval/avg_score_vs_committer",
                      c_avg_score, agent.total_steps_done)
+  if FLAGS.milestone_checkpoint:
+    m_wins, m_avg_score = eval_vs_model(
+        game, agent, eval_rng, FLAGS.eval_games,
+        FLAGS.milestone_checkpoint, info_state_size, num_actions)
+    logging.info("Final: %d/%d wins vs milestone (avg %.1f)",
+                 m_wins, FLAGS.eval_games, m_avg_score)
+    writer.add_scalar("eval/win_rate_vs_milestone",
+                       m_wins / FLAGS.eval_games, agent.total_steps_done)
+    writer.add_scalar("eval/avg_score_vs_milestone",
+                       m_avg_score, agent.total_steps_done)
 
   writer.close()
   if hasattr(envs, "close"):
