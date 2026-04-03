@@ -27,10 +27,7 @@ import re
 
 import pyspiel
 
-# Must import to register the game
-from open_spiel.python.games import lost_cities  # pylint: disable=unused-import
-
-# --- Card encoding constants (mirroring lost_cities.py) ---
+# --- Card encoding constants (mirroring lost_cities C++ game) ---
 
 _NUM_SUITS = 6
 _CARDS_PER_SUIT = 12
@@ -62,8 +59,17 @@ def _face_value(card_id):
   return ws - _NUM_CONTRACTS + 2
 
 
+def _card_name(card_id):
+  """Human-readable card name like 'bx0', 'b1'."""
+  suit = _SUIT_NAMES[_suit_of(card_id)]
+  ws = _within_suit(card_id)
+  if ws < _NUM_CONTRACTS:
+    return f"{suit}x{ws}"
+  return f"{suit}{ws - _NUM_CONTRACTS + 1}"
+
+
 def _card_name_to_id(name):
-  """Reverse of lost_cities._card_name(). E.g. 'bx0'->0, 'b1'->3, 'b9'->11."""
+  """Reverse of _card_name(). E.g. 'bx0'->0, 'b1'->3, 'b9'->11."""
   suit_char = name[0]
   suit = _SUIT_INDEX[suit_char]
   if 'x' in name:

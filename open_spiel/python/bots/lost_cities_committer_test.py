@@ -19,13 +19,12 @@ import numpy as np
 import pyspiel
 
 from open_spiel.python.bots import lost_cities_committer
-from open_spiel.python.games import lost_cities  # pylint: disable=unused-import
 
 
 def _play_game(bot0, bot1, rng, game=None):
   """Play a full game between two bots. Returns (terminal_state, returns)."""
   if game is None:
-    game = pyspiel.load_game("python_lost_cities")
+    game = pyspiel.load_game("lost_cities")
   state = game.new_initial_state()
   bots = [bot0, bot1]
   for b in bots:
@@ -53,7 +52,7 @@ class CardNameMappingTest(absltest.TestCase):
 
   def test_roundtrip(self):
     for card_id in range(72):
-      name = lost_cities._card_name(card_id)
+      name = lost_cities_committer._card_name(card_id)
       recovered = lost_cities_committer._card_name_to_id(name)
       self.assertEqual(card_id, recovered,
                        f"Roundtrip failed: {card_id} -> {name} -> {recovered}")
@@ -133,7 +132,7 @@ class CommitterBotTest(absltest.TestCase):
   def test_never_draws_from_just_discarded_suit(self):
     """After discarding, the bot should not draw from that same suit's pile."""
     rng = np.random.RandomState(42)
-    game = pyspiel.load_game("python_lost_cities")
+    game = pyspiel.load_game("lost_cities")
     num_violations = 0
 
     for seed in range(50):
