@@ -43,6 +43,7 @@ from torch.utils.tensorboard import SummaryWriter
 from open_spiel.python import rl_environment
 from open_spiel.python.bots import lost_cities_committer
 from open_spiel.python.pytorch import nash_pg
+from open_spiel.python.vector_env import SubprocVectorEnv
 from open_spiel.python.vector_env import SyncVectorEnv
 
 
@@ -82,6 +83,9 @@ flags.DEFINE_integer("update_epochs", 4, "PPO epochs per batch.")
 flags.DEFINE_integer("num_minibatches", 4, "Minibatches per PPO epoch.")
 flags.DEFINE_integer("outer_loop_every", 100,
                      "Updates between magnetic reference updates.")
+flags.DEFINE_integer("num_workers", 1,
+                     "Number of worker processes for env simulation. "
+                     "1 = synchronous (no subprocesses).")
 flags.DEFINE_integer("seed", 42, "Random seed.")
 flags.DEFINE_string("logdir", "runs/lost_cities_nash_pg",
                     "TensorBoard log directory.")
@@ -274,14 +278,28 @@ def eval_vs_committer(game, agent, rng, num_games, device="cpu"):
                               make_opponent=make_committer)
 
 
+def _make_env():
+  return rl_environment.Environment("lost_cities", enriched_obs=True)
+
+
 def main(unused_argv):
   # Always use enriched observations (517-dim).
-  envs = SyncVectorEnv([
-      rl_environment.Environment("lost_cities", enriched_obs=True)
-      for _ in range(FLAGS.num_envs)
-  ])
+  if FLAGS.num_workers > 1:
+    envs = SubprocVectorEnv(
+        num_envs=FLAGS.num_envs,
+        num_workers=FLAGS.num_workers,
+        env_constructor=_make_env,
+    )
+    logging.info("Using %d worker processes for %d environments.",
+                 FLAGS.num_workers, FLAGS.num_envs)
+  else:
+    envs = SyncVectorEnv([_make_env() for _ in range(FLAGS.num_envs)])
   info_state_size = envs.observation_spec()["info_state"][0]
-  num_actions = envs.envs[0].action_spec()["num_actions"]
+  # action_spec comes from the game, not the env instances.
+  # Use a temporary env to get it (SubprocVectorEnv doesn't expose envs[0]).
+  _tmp_env = _make_env()
+  num_actions = _tmp_env.action_spec()["num_actions"]
+  del _tmp_env
 
   # Resolve actor/critic layer sizes.
   hidden_layers_sizes = tuple(int(s) for s in FLAGS.hidden_layers_sizes)
@@ -418,6 +436,8 @@ def main(unused_argv):
                      c_avg_score, agent.total_steps_done)
 
   writer.close()
+  if hasattr(envs, "close"):
+    envs.close()
   total_time = time.time() - t_start
   logging.info("Done in %.1f hours. Checkpoints in %s",
                total_time / 3600, FLAGS.checkpoint_dir)
