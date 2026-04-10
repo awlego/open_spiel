@@ -141,14 +141,16 @@ class NashPGBot:
     return action.item()
 
 
-def save_checkpoint(agent, checkpoint_dir, update, outer_step):
+def save_checkpoint(agent, checkpoint_dir, update, outer_step,
+                    best_committer_wr=0.0):
   """Save agent networks, training state, and hyperparameter config."""
   ckpt_path = pathlib.Path(checkpoint_dir)
   ckpt_path.mkdir(parents=True, exist_ok=True)
 
   agent.save(str(ckpt_path))
 
-  meta = {"update": update, "outer_step": outer_step}
+  meta = {"update": update, "outer_step": outer_step,
+          "best_committer_wr": best_committer_wr}
   torch.save(meta, ckpt_path / "meta.pt")
 
   config = FLAGS.flag_values_dict()
@@ -157,6 +159,15 @@ def save_checkpoint(agent, checkpoint_dir, update, outer_step):
 
   logging.info("Checkpoint saved at update %d (outer step %d) to %s",
                update, outer_step, ckpt_path)
+
+
+def save_best_checkpoint(agent, checkpoint_dir, update, outer_step,
+                         best_committer_wr):
+  """Save a copy of the agent to {checkpoint_dir}/best/."""
+  best_dir = str(pathlib.Path(checkpoint_dir) / "best")
+  save_checkpoint(agent, best_dir, update, outer_step, best_committer_wr)
+  logging.info("New best checkpoint! committer_wr=%.4f at update %d",
+               best_committer_wr, update)
 
 
 def load_checkpoint(agent, checkpoint_dir):
@@ -168,7 +179,7 @@ def load_checkpoint(agent, checkpoint_dir):
   ckpt_path = pathlib.Path(checkpoint_dir)
   meta_file = ckpt_path / "meta.pt"
   if not meta_file.exists():
-    return 0, 0
+    return 0, 0, 0.0
 
   meta = torch.load(meta_file, weights_only=True)
   agent.restore(str(ckpt_path))
@@ -195,9 +206,10 @@ def load_checkpoint(agent, checkpoint_dir):
 
   update = meta["update"]
   outer_step = meta.get("outer_step", 0)
-  logging.info("Resumed from checkpoint at update %d (outer step %d)",
-               update, outer_step)
-  return update, outer_step
+  best_committer_wr = meta.get("best_committer_wr", 0.0)
+  logging.info("Resumed from checkpoint at update %d (outer step %d), "
+               "best committer wr=%.4f", update, outer_step, best_committer_wr)
+  return update, outer_step, best_committer_wr
 
 
 def _advance_non_agent(state, agent_player, rng, committer=None):
@@ -392,7 +404,8 @@ def main(unused_argv):
   )
 
   # Resume from checkpoint if available
-  start_update, outer_step = load_checkpoint(agent, FLAGS.checkpoint_dir)
+  start_update, outer_step, best_committer_wr = load_checkpoint(
+      agent, FLAGS.checkpoint_dir)
 
   writer = SummaryWriter(FLAGS.logdir)
   eval_rng = np.random.RandomState(FLAGS.seed + 1)
@@ -455,6 +468,12 @@ def main(unused_argv):
       writer.add_scalar("eval/avg_score_vs_committer", c_avg_score,
                          agent.total_steps_done)
 
+      # Save best checkpoint if committer win rate improved
+      if c_win_rate > best_committer_wr:
+        best_committer_wr = c_win_rate
+        save_best_checkpoint(agent, FLAGS.checkpoint_dir, update + 1,
+                             outer_step, best_committer_wr)
+
       # Evaluate vs milestone model (if configured)
       m_wr_str = ""
       if FLAGS.milestone_checkpoint:
@@ -485,10 +504,12 @@ def main(unused_argv):
 
     # Save checkpoints periodically
     if (update + 1) % FLAGS.checkpoint_every == 0:
-      save_checkpoint(agent, FLAGS.checkpoint_dir, update + 1, outer_step)
+      save_checkpoint(agent, FLAGS.checkpoint_dir, update + 1, outer_step,
+                      best_committer_wr)
 
   # Final checkpoint and evaluation
-  save_checkpoint(agent, FLAGS.checkpoint_dir, FLAGS.total_updates, outer_step)
+  save_checkpoint(agent, FLAGS.checkpoint_dir, FLAGS.total_updates, outer_step,
+                  best_committer_wr)
 
   wins, avg_score = eval_vs_random(game, agent, eval_rng, FLAGS.eval_games)
   c_wins, c_avg_score = eval_vs_committer(

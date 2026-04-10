@@ -1,6 +1,8 @@
 # auxiliary inputs
 checkpoints
 checkpoint*
+runs/
+abandoned/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
