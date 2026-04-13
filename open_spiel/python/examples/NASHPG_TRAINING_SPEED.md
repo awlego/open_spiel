@@ -20,13 +20,37 @@ PYTHONPATH=. env3.12/bin/python open_spiel/python/examples/nash_pg_lost_cities_v
 tensorboard --logdir=runs/lost_cities_nash_pg
 ```
 
-### Run Benchmark
+### Run Throughput Benchmark
 ```bash
-# Baseline benchmark (3 runs, prints steps/s and breakdown)
+# Throughput benchmark (3 runs, prints steps/s and breakdown)
 PYTHONPATH=. env3.12/bin/python open_spiel/python/examples/nash_pg_benchmark.py \
   --experiment_label="baseline" --num_runs=3
 
-# View all benchmark results
+# With raw path + workers:
+PYTHONPATH=. env3.12/bin/python open_spiel/python/examples/nash_pg_benchmark.py \
+  --experiment_label="raw_6w" --use_raw --num_workers=6 --num_runs=3
+```
+
+### Run Convergence Benchmark
+```bash
+# Convergence benchmark: real training with periodic eval vs CommitterBot.
+# Reports time-to-target for win rate thresholds (35%, 40%, 45%, 50%, 55%).
+# Default: 5,000 updates, eval every 250, 2,000 eval games (~35 min).
+PYTHONPATH=. env3.12/bin/python open_spiel/python/examples/nash_pg_benchmark.py \
+  --convergence --experiment_label="4ep4mb" --use_raw --num_workers=6
+
+# Compare a different hyperparameter config:
+PYTHONPATH=. env3.12/bin/python open_spiel/python/examples/nash_pg_benchmark.py \
+  --convergence --experiment_label="2ep2mb" --use_raw --num_workers=6 \
+  --update_epochs=2 --num_minibatches=2
+
+# Quick convergence test (fewer updates, ~7 min):
+PYTHONPATH=. env3.12/bin/python open_spiel/python/examples/nash_pg_benchmark.py \
+  --convergence --convergence_updates=1000 --experiment_label="quick_test"
+```
+
+### View Results
+```bash
 cat benchmark_results.jsonl | python3 -m json.tool --no-ensure-ascii
 ```
 
@@ -252,7 +276,14 @@ The default 4 epochs x 4 minibatches = 16 forward+backward passes per update. Re
 ## Notes for Future Claude Sessions
 
 - The benchmark script (`nash_pg_benchmark.py`) appends to `benchmark_results.jsonl`. Read this file to see all past experiments.
-- Always run with `--num_runs=3` and compare against the baseline range (8,826 - 9,042).
-- The profiler shows env.step() is 45% of time. Focus optimizations there first.
-- The agent Python loop (extracting observations from TimeStep objects) is a significant chunk of agent.step(). Eliminating TimeStep construction is likely the highest-impact pure-Python optimization.
-- SubprocVectorEnv with `--num_workers` is the easiest win to try next.
+- **Two benchmark modes**: `--convergence` for training quality (win rate vs wall-clock), default for throughput (steps/s).
+- For throughput, always run with `--num_runs=3` and compare against the baseline range (8,826 - 9,042).
+- For convergence, use `--convergence --convergence_updates=5000` (~35 min with raw+6workers). Compares time-to-target for committer WR thresholds.
+- **Reference convergence milestones** (from v3 training runs with 128x128 network):
+  - ~40% committer WR at ~5,000 updates (41M steps)
+  - ~45% at ~10,000 updates (82M steps)
+  - ~50% at ~15,000-20,000 updates
+  - ~55% at ~25,000 updates
+  - ~60% at ~40,000-45,000 updates
+- When testing hyperparameter changes (epochs, minibatches, learning rate), use convergence mode to validate that faster throughput translates to faster convergence.
+- Max 6 worker processes (hard cap in both benchmark and training scripts).
