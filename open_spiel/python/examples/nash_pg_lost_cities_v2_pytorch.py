@@ -85,7 +85,7 @@ flags.DEFINE_integer("outer_loop_every", 100,
                      "Updates between magnetic reference updates.")
 flags.DEFINE_integer("num_workers", 1,
                      "Number of worker processes for env simulation. "
-                     "1 = synchronous (no subprocesses).")
+                     "1 = synchronous (no subprocesses). Max 6.")
 flags.DEFINE_integer("seed", 42, "Random seed.")
 flags.DEFINE_string("logdir", "runs/lost_cities_nash_pg",
                     "TensorBoard log directory.")
@@ -353,6 +353,9 @@ def _make_env():
 
 def main(unused_argv):
   # Always use enriched observations (517-dim).
+  if FLAGS.num_workers > 6:
+    logging.warning("Capping num_workers to 6 (max allowed).")
+    FLAGS.num_workers = 6
   if FLAGS.num_workers > 1:
     envs = SubprocVectorEnv(
         num_envs=FLAGS.num_envs,

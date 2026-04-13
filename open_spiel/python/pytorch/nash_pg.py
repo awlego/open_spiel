@@ -269,7 +269,7 @@ class NashPGAgent:
     obs = torch.as_tensor(self._step_obs_np, device=self._device)
     mask = self._step_mask
 
-    with torch.no_grad():
+    with torch.inference_mode():
       action, logprob, _, value, probs = self._network.get_action_and_value(
           obs, mask)
 
@@ -285,6 +285,33 @@ class NashPGAgent:
         rl_agent.StepOutput(action=a.item(), probs=p)
         for a, p in zip(action, probs)
     ]
+
+  def step_raw(self, obs_np, mask_np, players_np):
+    """Select actions from pre-filled numpy arrays (no TimeStep overhead).
+
+    Args:
+      obs_np: [num_envs, info_state_size] float32 numpy array.
+      mask_np: [num_envs, num_actions] bool numpy array.
+      players_np: [num_envs] int32 numpy array of current player ids.
+
+    Returns:
+      numpy int32 array of actions, shape [num_envs].
+    """
+    obs = torch.as_tensor(obs_np, device=self._device)
+    mask = torch.as_tensor(mask_np, device=self._device)
+
+    with torch.inference_mode():
+      action, logprob, _, value, _ = self._network.get_action_and_value(
+          obs, mask)
+
+    self.obs[self.cur_batch_idx] = obs
+    self.legal_actions_mask[self.cur_batch_idx] = mask
+    self.actions[self.cur_batch_idx] = action
+    self.logprobs[self.cur_batch_idx] = logprob
+    self.values[self.cur_batch_idx] = value.flatten()
+    self._acting_players[self.cur_batch_idx] = players_np
+
+    return action.cpu().numpy()
 
   def eval_step(self, time_steps):
     """Select greedy actions for a variable-sized batch (eval only).
@@ -308,7 +335,7 @@ class NashPGAgent:
       mask[i, ts.observations["legal_actions"][pid]] = True
 
     obs = torch.as_tensor(obs_np, device=self._device)
-    with torch.no_grad():
+    with torch.inference_mode():
       action, _, _, _, _ = self._network.get_action_and_value(obs, mask)
     return [a.item() for a in action]
 
@@ -331,6 +358,149 @@ class NashPGAgent:
     self.total_steps_done += self._num_envs
     self.cur_batch_idx += 1
 
+  def post_step_raw(self, rewards_np, dones_np, players_np):
+    """Record rewards and dones from raw numpy arrays.
+
+    Args:
+      rewards_np: [num_envs, num_players] float64 numpy array.
+      dones_np: [num_envs] bool numpy array.
+      players_np: [num_envs] int32 numpy array (acting player from step_raw).
+    """
+    acting = self._acting_players[self.cur_batch_idx]
+    # Extract reward for the player who acted
+    r_np = rewards_np[np.arange(self._num_envs), acting].astype(np.float32)
+    self.rewards[self.cur_batch_idx] = torch.from_numpy(r_np)
+    self.dones[self.cur_batch_idx] = torch.from_numpy(
+        dones_np.astype(np.float32))
+    self.total_steps_done += self._num_envs
+    self.cur_batch_idx += 1
+
+  def learn_raw(self, obs_np, players_np):
+    """learn() variant that bootstraps from raw numpy arrays.
+
+    Args:
+      obs_np: [num_envs, info_state_size] float32 numpy array.
+      players_np: [num_envs] int32 numpy array of current player ids.
+    """
+    next_obs = torch.as_tensor(obs_np, device=self._device)
+
+    with torch.inference_mode():
+      next_value = self._network.get_value(next_obs).reshape(1, -1)
+      next_players = players_np
+
+      advantages = torch.zeros_like(self.rewards, device=self._device)
+      lastgaelam = 0
+      for t in reversed(range(self._steps_per_batch)):
+        if t == self._steps_per_batch - 1:
+          nextvalues = next_value
+          next_acting = next_players
+        else:
+          nextvalues = self.values[t + 1]
+          next_acting = self._acting_players[t + 1]
+
+        player_sign = torch.tensor(
+            [1.0 if self._acting_players[t][i] == next_acting[i] else -1.0
+             for i in range(self._num_envs)],
+            dtype=torch.float32, device=self._device)
+
+        nextnonterminal = 1.0 - self.dones[t]
+        delta = (self.rewards[t]
+                 + self._gamma * player_sign * nextvalues * nextnonterminal
+                 - self.values[t])
+        advantages[t] = lastgaelam = (
+            delta + self._gamma * self._gae_lambda
+            * nextnonterminal * player_sign * lastgaelam)
+      returns = advantages + self.values
+
+    # Flatten and train (same as learn())
+    b_obs = self.obs.reshape(-1, self._info_state_size)
+    b_logprobs = self.logprobs.reshape(-1)
+    b_actions = self.actions.reshape(-1)
+    b_advantages = advantages.reshape(-1)
+    b_returns = returns.reshape(-1)
+    b_values = self.values.reshape(-1)
+    b_legal_masks = self.legal_actions_mask.reshape(-1, self._num_actions)
+
+    with torch.inference_mode():
+      mag_logits = self._magnetic_network.get_policy_logits(b_obs)
+      mag_logits = torch.where(
+          b_legal_masks, mag_logits,
+          torch.tensor(INVALID_ACTION_PENALTY, device=self._device))
+      mag_log_probs = F.log_softmax(mag_logits, dim=-1)
+      mag_probs = F.softmax(mag_logits, dim=-1)
+
+    b_inds = np.arange(self._batch_size)
+
+    for _ in range(self._update_epochs):
+      np.random.shuffle(b_inds)
+      for start in range(0, self._batch_size, self._minibatch_size):
+        end = start + self._minibatch_size
+        mb = b_inds[start:end]
+
+        _, new_log_prob, entropy, new_value, new_probs = (
+            self._network.get_action_and_value(
+                b_obs[mb],
+                legal_actions_mask=b_legal_masks[mb],
+                action=b_actions[mb]))
+
+        log_ratio = new_log_prob - b_logprobs[mb]
+        ratio = log_ratio.exp()
+
+        mb_advantages = b_advantages[mb]
+        if len(mb_advantages) > 1:
+          mb_advantages = (mb_advantages - mb_advantages.mean()) / (
+              mb_advantages.std() + 1e-8)
+
+        pg_loss1 = -mb_advantages * ratio
+        pg_loss2 = -mb_advantages * torch.clamp(
+            ratio, 1 - self._clip_coef, 1 + self._clip_coef)
+        pg_loss = torch.max(pg_loss1, pg_loss2).mean()
+
+        new_value = new_value.view(-1)
+        if self._clip_vloss:
+          v_loss_unclipped = (new_value - b_returns[mb]) ** 2
+          v_clipped = b_values[mb] + torch.clamp(
+              new_value - b_values[mb],
+              -self._clip_coef, self._clip_coef)
+          v_loss_clipped = (v_clipped - b_returns[mb]) ** 2
+          v_loss = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped).mean()
+        else:
+          v_loss = 0.5 * ((new_value - b_returns[mb]) ** 2).mean()
+
+        entropy_loss = entropy.mean()
+
+        mb_mag_probs = mag_probs[mb]
+        mb_mag_log_probs = mag_log_probs[mb]
+        mb_legal = b_legal_masks[mb].float()
+
+        if self._magnetic_divergence == "kl":
+          new_log_probs_all = torch.log(new_probs + 1e-10)
+          kl = (new_probs * (new_log_probs_all - mb_mag_log_probs) *
+                mb_legal).sum(dim=-1)
+          mag_loss = kl.mean()
+        else:
+          l2 = 0.5 * ((new_probs - mb_mag_probs) ** 2 * mb_legal).sum(dim=-1)
+          mag_loss = l2.mean()
+
+        loss = (pg_loss
+                - self._entropy_cost * entropy_loss
+                + self._value_coef * v_loss
+                + self._magnetic_cost * mag_loss)
+
+        self._optimizer.zero_grad()
+        loss.backward()
+        nn.utils.clip_grad_norm_(
+            self._network.parameters(), self._max_grad_norm)
+        self._optimizer.step()
+
+    self._last_pg_loss = pg_loss.item()
+    self._last_v_loss = v_loss.item()
+    self._last_mag_loss = mag_loss.item()
+    self._last_entropy = entropy_loss.item()
+
+    self.cur_batch_idx = 0
+    self.updates_done += 1
+
   def learn(self, time_steps):
     """Compute GAE, flatten buffers, and run PPO + magnetic updates.
 
@@ -345,7 +515,7 @@ class NashPGAgent:
     next_obs = torch.tensor(
         np.array(obs_list), dtype=torch.float32, device=self._device)
 
-    with torch.no_grad():
+    with torch.inference_mode():
       next_value = self._network.get_value(next_obs).reshape(1, -1)
 
       # Determine the current player for the bootstrap state
@@ -392,7 +562,7 @@ class NashPGAgent:
     b_legal_masks = self.legal_actions_mask.reshape(-1, self._num_actions)
 
     # Get magnetic policy log-probs (frozen, no grad)
-    with torch.no_grad():
+    with torch.inference_mode():
       mag_logits = self._magnetic_network.get_policy_logits(b_obs)
       mag_logits = torch.where(
           b_legal_masks, mag_logits,

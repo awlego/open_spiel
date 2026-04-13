@@ -230,6 +230,69 @@ class SubprocVectorEnv(object):
       self._cmd_events[i].set()
     self._done_barrier.wait()
 
+  def _init_raw_buffers(self):
+    """Allocate output buffers for the raw step path."""
+    n = self._num_envs
+    self._raw_obs = np.zeros(
+        (n, self._info_state_size), dtype=np.float32)
+    self._raw_mask = np.zeros(
+        (n, self._num_actions), dtype=np.bool_)
+    self._raw_players = np.zeros(n, dtype=np.int32)
+    self._raw_rewards = np.zeros(
+        (n, self._num_players), dtype=np.float64)
+    self._raw_dones = np.zeros(n, dtype=np.bool_)
+    self._env_indices = np.arange(n)
+    self._raw_initialized = True
+
+  def _read_raw(self):
+    """Read acting player's obs/mask from shared memory using numpy indexing."""
+    if not getattr(self, "_raw_initialized", False):
+      self._init_raw_buffers()
+    players = self._cur_player_np.copy()
+    self._raw_players[:] = players
+    # Advanced indexing: extract acting player's observation and legal mask
+    self._raw_obs[:] = self._obs_np[self._env_indices, players]
+    # Convert int mask (0/1) to bool mask
+    np.greater(self._legal_np[self._env_indices, players], 0,
+               out=self._raw_mask)
+    return self._raw_obs, self._raw_mask, self._raw_players
+
+  def step_raw(self, actions, reset_if_done=False):
+    """Step all environments using raw numpy arrays (no TimeStep objects).
+
+    Args:
+      actions: numpy int array of shape [num_envs].
+      reset_if_done: if True, auto-reset terminal environments.
+
+    Returns:
+      (obs, mask, players, rewards, dones) numpy arrays.
+    """
+    if not getattr(self, "_raw_initialized", False):
+      self._init_raw_buffers()
+    # Write actions directly into shared memory
+    self._actions_np[:] = actions
+    self._reset_flags_np[0] = int(reset_if_done)
+
+    self._signal_workers(0)
+
+    # Read results from shared memory
+    self._raw_rewards[:] = self._rewards_np
+    np.greater(self._dones_np, 0, out=self._raw_dones)
+
+    obs, mask, players = self._read_raw()
+    return obs, mask, players, self._raw_rewards, self._raw_dones
+
+  def reset_raw(self):
+    """Reset all environments, returning raw numpy arrays."""
+    if not getattr(self, "_raw_initialized", False):
+      self._init_raw_buffers()
+    self._reset_flags_np[:] = 1
+    self._signal_workers(1)
+    self._raw_dones[:] = False
+    self._raw_rewards[:] = 0.0
+    obs, mask, players = self._read_raw()
+    return obs, mask, players
+
   def _read_timesteps(self):
     """Construct TimeStep objects from shared memory arrays.
 
@@ -342,6 +405,33 @@ class SyncVectorEnv(object):
       raise ValueError(
           "Need to call this with a list of rl_environment.Environment objects")
     self.envs = envs
+    self._raw_buffers = None
+
+  def _init_raw_buffers(self):
+    """Lazily allocate numpy buffers for the raw step path."""
+    num_envs = len(self.envs)
+    num_players = self.envs[0].num_players
+    info_state_size = self.observation_spec()["info_state"][0]
+    num_actions = self.envs[0].action_spec()["num_actions"]
+    self._raw_buffers = {
+        "obs": np.zeros((num_envs, info_state_size), dtype=np.float32),
+        "mask": np.zeros((num_envs, num_actions), dtype=np.bool_),
+        "players": np.zeros(num_envs, dtype=np.int32),
+        "rewards": np.zeros((num_envs, num_players), dtype=np.float64),
+        "dones": np.zeros(num_envs, dtype=np.bool_),
+        "num_players": num_players,
+        "info_state_size": info_state_size,
+        "num_actions": num_actions,
+    }
+
+  def _fill_raw_from_timestep(self, i, ts):
+    """Write one environment's TimeStep data into raw buffers."""
+    b = self._raw_buffers
+    pid = ts.observations["current_player"]
+    b["players"][i] = pid
+    b["obs"][i] = ts.observations["info_state"][pid]
+    b["mask"][i] = False
+    b["mask"][i, ts.observations["legal_actions"][pid]] = True
 
   def __len__(self):
     return len(self.envs)
@@ -352,6 +442,55 @@ class SyncVectorEnv(object):
   @property
   def num_players(self):
     return self.envs[0].num_players
+
+  def step_raw(self, actions, reset_if_done=False):
+    """Step all environments using raw numpy arrays (no TimeStep objects).
+
+    Args:
+      actions: numpy int array of shape [num_envs], one action per env.
+      reset_if_done: if True, auto-reset terminal environments.
+
+    Returns:
+      (obs, mask, players, rewards, dones) numpy arrays.
+      obs: [num_envs, info_state_size] float32 - acting player's observation.
+      mask: [num_envs, num_actions] bool - legal actions mask.
+      players: [num_envs] int32 - current player id.
+      rewards: [num_envs, num_players] float64 - rewards from this step.
+      dones: [num_envs] bool - whether episode ended.
+    """
+    if self._raw_buffers is None:
+      self._init_raw_buffers()
+    b = self._raw_buffers
+
+    for i in range(len(self.envs)):
+      ts = self.envs[i].step([int(actions[i])])
+      b["dones"][i] = ts.last()
+      if ts.rewards is not None:
+        for p in range(b["num_players"]):
+          b["rewards"][i, p] = ts.rewards[p]
+
+      if b["dones"][i] and reset_if_done:
+        ts = self.envs[i].reset()
+
+      self._fill_raw_from_timestep(i, ts)
+
+    return b["obs"], b["mask"], b["players"], b["rewards"], b["dones"]
+
+  def reset_raw(self):
+    """Reset all environments, returning raw numpy arrays.
+
+    Returns:
+      (obs, mask, players) numpy arrays.
+    """
+    if self._raw_buffers is None:
+      self._init_raw_buffers()
+    b = self._raw_buffers
+    for i in range(len(self.envs)):
+      ts = self.envs[i].reset()
+      self._fill_raw_from_timestep(i, ts)
+    b["dones"][:] = False
+    b["rewards"][:] = 0.0
+    return b["obs"], b["mask"], b["players"]
 
   def step(self, step_outputs, reset_if_done=False):
     """Apply one step.
