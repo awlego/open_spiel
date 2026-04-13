@@ -33,20 +33,24 @@ PYTHONPATH=. env3.12/bin/python open_spiel/python/examples/nash_pg_benchmark.py 
 
 ### Run Convergence Benchmark
 ```bash
-# Convergence benchmark: real training with periodic eval vs CommitterBot.
-# Reports time-to-target for win rate thresholds (35%, 40%, 45%, 50%, 55%).
-# Default: 5,000 updates, eval every 250, 2,000 eval games (~35 min).
+# Quick convergence test (~8 min with raw+6workers):
+# Tracks avg score vs CommitterBot (more granular than WR for short runs).
+# Score targets: -40, -30, -20, -10, 0. Typical: score > -20 at ~5 min.
+PYTHONPATH=. env3.12/bin/python open_spiel/python/examples/nash_pg_benchmark.py \
+  --convergence --experiment_label="quick_baseline" \
+  --convergence_updates=1000 --convergence_eval_every=100 \
+  --convergence_eval_games=1000 --use_raw --num_workers=6
+
+# Full convergence test (~35 min with raw+6workers):
+# Also tracks WR targets: 35%, 40%, 45%, 50%, 55%.
 PYTHONPATH=. env3.12/bin/python open_spiel/python/examples/nash_pg_benchmark.py \
   --convergence --experiment_label="4ep4mb" --use_raw --num_workers=6
 
 # Compare a different hyperparameter config:
 PYTHONPATH=. env3.12/bin/python open_spiel/python/examples/nash_pg_benchmark.py \
   --convergence --experiment_label="2ep2mb" --use_raw --num_workers=6 \
-  --update_epochs=2 --num_minibatches=2
-
-# Quick convergence test (fewer updates, ~7 min):
-PYTHONPATH=. env3.12/bin/python open_spiel/python/examples/nash_pg_benchmark.py \
-  --convergence --convergence_updates=1000 --experiment_label="quick_test"
+  --convergence_updates=1000 --convergence_eval_every=100 \
+  --convergence_eval_games=1000 --update_epochs=2 --num_minibatches=2
 ```
 
 ### View Results
@@ -279,6 +283,8 @@ The default 4 epochs x 4 minibatches = 16 forward+backward passes per update. Re
 - **Two benchmark modes**: `--convergence` for training quality (win rate vs wall-clock), default for throughput (steps/s).
 - For throughput, always run with `--num_runs=3` and compare against the baseline range (8,826 - 9,042).
 - For convergence, use `--convergence --convergence_updates=5000` (~35 min with raw+6workers). Compares time-to-target for committer WR thresholds.
+- For **quick tests (~8 min)**: use `--convergence_updates=1000 --convergence_eval_every=100 --convergence_eval_games=1000`. Compare `score_to_target` (time to reach score > -40, -30, -20). Score > -20 is reachable within ~5 min.
+- For **full tests (~35 min)**: use defaults (`--convergence_updates=5000`). Compare `wr_to_target` (time to reach 35%, 40% committer WR).
 - **Reference convergence milestones** (from v3 training runs with 128x128 network):
   - ~40% committer WR at ~5,000 updates (41M steps)
   - ~45% at ~10,000 updates (82M steps)

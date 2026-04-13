@@ -258,8 +258,13 @@ def eval_vs_committer(game, agent, rng, num_games):
                               make_opponent=make_committer)
 
 
-# Win rate thresholds to report time-to-target for.
-CONVERGENCE_TARGETS = [0.35, 0.40, 0.45, 0.50, 0.55]
+# Win rate thresholds to report time-to-target for (long runs).
+WR_TARGETS = [0.35, 0.40, 0.45, 0.50, 0.55]
+
+# Avg score vs committer thresholds (useful for short runs where WR targets
+# aren't reachable). A random agent scores about -60; CommitterBot saturates
+# around +20. These are reachable within 1,000-2,000 updates.
+SCORE_TARGETS = [-40, -30, -20, -10, 0]
 
 
 def run_convergence_benchmark(envs, agent, game, config):
@@ -277,8 +282,9 @@ def run_convergence_benchmark(envs, agent, game, config):
 
   # Convergence curve: list of (wall_seconds, update, committer_wr, steps_per_sec)
   curve = []
-  # Time-to-target: {threshold: wall_seconds or None}
-  time_to_target = {t: None for t in CONVERGENCE_TARGETS}
+  # Time-to-target for WR and score thresholds.
+  wr_to_target = {t: None for t in WR_TARGETS}
+  score_to_target = {t: None for t in SCORE_TARGETS}
 
   if use_raw:
     obs, mask, players = envs.reset_raw()
@@ -328,10 +334,14 @@ def run_convergence_benchmark(envs, agent, game, config):
           "steps_per_sec": round(steps_per_sec),
       })
 
-      # Check targets
-      for target in CONVERGENCE_TARGETS:
-        if time_to_target[target] is None and c_wr >= target:
-          time_to_target[target] = round(wall_s, 1)
+      # Check WR targets
+      for target in WR_TARGETS:
+        if wr_to_target[target] is None and c_wr >= target:
+          wr_to_target[target] = round(wall_s, 1)
+      # Check score targets
+      for target in SCORE_TARGETS:
+        if score_to_target[target] is None and c_avg_score >= target:
+          score_to_target[target] = round(wall_s, 1)
 
       pg_loss, v_loss, mag_loss, ent = agent.loss
       logging.info(
@@ -352,21 +362,30 @@ def run_convergence_benchmark(envs, agent, game, config):
                total_updates, total_wall / 60,
                agent.total_steps_done / total_wall)
   logging.info("")
-  logging.info("Time to reach committer win rate targets:")
-  for target in CONVERGENCE_TARGETS:
-    t = time_to_target[target]
+  logging.info("Time to reach avg score targets (vs committer):")
+  for target in SCORE_TARGETS:
+    t = score_to_target[target]
+    if t is not None:
+      logging.info("  score > %d: %.1f min (%.0fs)", target, t / 60, t)
+    else:
+      logging.info("  score > %d: not reached", target)
+  logging.info("")
+  logging.info("Time to reach win rate targets (vs committer):")
+  for target in WR_TARGETS:
+    t = wr_to_target[target]
     if t is not None:
       logging.info("  %.0f%% WR: %.1f min (%.0fs)", target * 100, t / 60, t)
     else:
       logging.info("  %.0f%% WR: not reached", target * 100)
   logging.info("")
   logging.info("Convergence curve:")
-  logging.info("  %6s  %6s  %10s  %8s  %9s", "update", "wall_s", "steps",
-               "cmtr_wr", "steps/s")
+  logging.info("  %6s  %6s  %10s  %8s  %6s  %9s", "update", "wall_s",
+               "steps", "cmtr_wr", "score", "steps/s")
   for pt in curve:
-    logging.info("  %6d  %6.1f  %10d  %7.2f%%  %9d",
+    logging.info("  %6d  %6.1f  %10d  %7.2f%%  %6.1f  %9d",
                  pt["update"], pt["wall_seconds"], pt["total_steps"],
-                 pt["committer_wr"] * 100, pt["steps_per_sec"])
+                 pt["committer_wr"] * 100, pt["committer_avg_score"],
+                 pt["steps_per_sec"])
 
   return {
       "total_wall_seconds": round(total_wall, 1),
@@ -374,7 +393,9 @@ def run_convergence_benchmark(envs, agent, game, config):
       "total_steps": agent.total_steps_done,
       "avg_steps_per_sec": round(agent.total_steps_done / total_wall),
       "final_committer_wr": curve[-1]["committer_wr"] if curve else None,
-      "time_to_target": time_to_target,
+      "final_committer_score": curve[-1]["committer_avg_score"] if curve else None,
+      "wr_to_target": wr_to_target,
+      "score_to_target": score_to_target,
       "curve": curve,
   }
 
