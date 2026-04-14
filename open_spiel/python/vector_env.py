@@ -70,10 +70,7 @@ def _shm_worker_loop(worker_id, env_start, env_count, env_constructor,
         # Auto-reset if done, then write the (possibly reset) observation.
         if is_done and reset_flags_np[0]:
           ts = envs[j].reset()
-        elif is_done:
-          pass  # leave terminal obs
-        else:
-          ts = envs[j].get_time_step()
+        # Non-done: ts from step() already has the correct post-chance state
 
         _write_timestep(ts, gi, obs_np, legal_np, cur_player_np,
                         step_type_np, num_players, info_state_size, num_actions)
