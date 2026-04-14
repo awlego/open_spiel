@@ -113,10 +113,13 @@ flags.DEFINE_bool("layer_norm", False,
                   "Use LayerNorm in actor and critic networks.")
 flags.DEFINE_bool("batch_stepper", False,
                   "Use C++ BatchStepper (no subprocesses, single call stepping).")
+flags.DEFINE_string("profile", "",
+                    "Enable torch.profiler and write Chrome trace to this path "
+                    "(e.g. 'trace.json'). Profiles the throughput benchmark loop.")
 
 
 def run_one_benchmark(envs, agent, num_updates, num_steps, num_envs,
-                      use_raw=False):
+                      use_raw=False, profiler=None):
   """Run one benchmark pass and return timing dict."""
   t_env_step = 0.0
   t_agent_step = 0.0
@@ -130,41 +133,53 @@ def run_one_benchmark(envs, agent, num_updates, num_steps, num_envs,
   t_total_start = time.perf_counter()
 
   for update in range(num_updates):
-    for _ in range(num_steps):
-      if use_raw:
-        t0 = time.perf_counter()
-        actions = agent.step_raw(obs, mask, players)
-        t1 = time.perf_counter()
-        obs, mask, players, rewards, dones = envs.step_raw(
-            actions, reset_if_done=True)
-        t2 = time.perf_counter()
-        agent.post_step_raw(rewards, dones, players)
-        t3 = time.perf_counter()
-      else:
-        t0 = time.perf_counter()
-        agent_output = agent.step(time_steps)
-        t1 = time.perf_counter()
-        time_steps, rewards, dones, _ = envs.step(
-            agent_output, reset_if_done=True)
-        t2 = time.perf_counter()
-        agent.post_step(rewards, dones)
-        t3 = time.perf_counter()
+    with torch.profiler.record_function(f"rollout_{update}"):
+      for step_idx in range(num_steps):
+        if use_raw:
+          t0 = time.perf_counter()
+          with torch.profiler.record_function("agent.step_raw"):
+            actions = agent.step_raw(obs, mask, players)
+          t1 = time.perf_counter()
+          with torch.profiler.record_function("env.step_raw"):
+            obs, mask, players, rewards, dones = envs.step_raw(
+                actions, reset_if_done=True)
+          t2 = time.perf_counter()
+          with torch.profiler.record_function("post_step_raw"):
+            agent.post_step_raw(rewards, dones, players)
+          t3 = time.perf_counter()
+        else:
+          t0 = time.perf_counter()
+          with torch.profiler.record_function("agent.step"):
+            agent_output = agent.step(time_steps)
+          t1 = time.perf_counter()
+          with torch.profiler.record_function("env.step"):
+            time_steps, rewards, dones, _ = envs.step(
+                agent_output, reset_if_done=True)
+          t2 = time.perf_counter()
+          with torch.profiler.record_function("post_step"):
+            agent.post_step(rewards, dones)
+          t3 = time.perf_counter()
 
-      t_agent_step += t1 - t0
-      t_env_step += t2 - t1
-      t_post_step += t3 - t2
+        t_agent_step += t1 - t0
+        t_env_step += t2 - t1
+        t_post_step += t3 - t2
 
     t0 = time.perf_counter()
-    if use_raw:
-      agent.learn_raw(obs, players)
-    else:
-      agent.learn(time_steps)
+    with torch.profiler.record_function("learn"):
+      if use_raw:
+        agent.learn_raw(obs, players)
+      else:
+        agent.learn(time_steps)
     t1 = time.perf_counter()
     t_learn += t1 - t0
 
+    if profiler is not None:
+      profiler.step()
+
   # Wait for any pending async learn to complete
   if hasattr(agent, '_wait_for_learn'):
-    agent._wait_for_learn()
+    with torch.profiler.record_function("wait_for_learn"):
+      agent._wait_for_learn()
 
   t_total = time.perf_counter() - t_total_start
   total_steps = num_updates * num_steps * num_envs
@@ -552,14 +567,32 @@ def main_throughput(envs, agent, config):
 
   # Run multiple passes and average
   all_results = []
+  profiler = None
+  if FLAGS.profile:
+    profiler = torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU],
+        record_shapes=False,
+        with_stack=False,
+        schedule=torch.profiler.schedule(
+            wait=0, warmup=0, active=FLAGS.num_updates, repeat=1),
+    )
+    profiler.start()
+
   for run_idx in range(FLAGS.num_runs):
     result = run_one_benchmark(envs, agent, FLAGS.num_updates,
                                 FLAGS.num_steps, FLAGS.num_envs,
-                                use_raw=FLAGS.use_raw)
+                                use_raw=FLAGS.use_raw,
+                                profiler=profiler)
     all_results.append(result)
     logging.info("Run %d/%d: %.0f steps/s (%.2fs total)",
                  run_idx + 1, FLAGS.num_runs,
                  result["steps_per_sec"], result["total_time_s"])
+    if profiler is not None:
+      # Only profile the first run
+      profiler.stop()
+      profiler.export_chrome_trace(FLAGS.profile)
+      logging.info("Chrome trace written to %s", FLAGS.profile)
+      profiler = None
 
   # Compute averages
   avg = {}

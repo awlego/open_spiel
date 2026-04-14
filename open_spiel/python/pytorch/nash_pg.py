@@ -276,7 +276,7 @@ class NashPGAgent:
 
     # Async learn: double-buffered rollout with background learn thread
     self._async_learn = async_learn
-    self._learn_thread = None
+    self._learn_threads = [None, None]  # one learn thread per buffer
     self._inference_network = None
     if async_learn:
       # Allocate a second set of rollout buffers
@@ -495,68 +495,76 @@ class NashPGAgent:
     This is the core learn logic, factored out so it can run either
     synchronously or in a background thread (async mode).
     """
-    obs = buf["obs"] if isinstance(buf, dict) else self.obs
-    actions = buf["actions"] if isinstance(buf, dict) else self.actions
-    logprobs = buf["logprobs"] if isinstance(buf, dict) else self.logprobs
-    rewards = buf["rewards"] if isinstance(buf, dict) else self.rewards
-    dones = buf["dones"] if isinstance(buf, dict) else self.dones
-    values = buf["values"] if isinstance(buf, dict) else self.values
-    legal_masks = (buf["legal_actions_mask"] if isinstance(buf, dict)
-                   else self.legal_actions_mask)
-    acting_players = (buf["acting_players"] if isinstance(buf, dict)
-                      else self._acting_players)
+    with torch.profiler.record_function("gae_and_ppo"):
+      obs = buf["obs"] if isinstance(buf, dict) else self.obs
+      actions = buf["actions"] if isinstance(buf, dict) else self.actions
+      logprobs = buf["logprobs"] if isinstance(buf, dict) else self.logprobs
+      rewards = buf["rewards"] if isinstance(buf, dict) else self.rewards
+      dones = buf["dones"] if isinstance(buf, dict) else self.dones
+      values = buf["values"] if isinstance(buf, dict) else self.values
+      legal_masks = (buf["legal_actions_mask"] if isinstance(buf, dict)
+                     else self.legal_actions_mask)
+      acting_players = (buf["acting_players"] if isinstance(buf, dict)
+                        else self._acting_players)
 
-    with torch.inference_mode():
-      # If critic was deferred during rollout, compute all values now in batch
-      if self._defer_critic:
-        all_obs = obs.reshape(-1, self._info_state_size)
-        all_values = self._network.get_value(all_obs).reshape(
-            self._steps_per_batch, self._num_envs)
-        values[:] = all_values
+      with torch.profiler.record_function("gae_compute"):
+        with torch.inference_mode():
+          # If critic was deferred during rollout, compute all values now
+          if self._defer_critic:
+            all_obs = obs.reshape(-1, self._info_state_size)
+            all_values = self._network.get_value(all_obs).reshape(
+                self._steps_per_batch, self._num_envs)
+            values[:] = all_values
 
-      next_value = self._network.get_value(next_obs).reshape(1, -1)
+          next_value = self._network.get_value(next_obs).reshape(1, -1)
 
-      advantages = torch.zeros_like(rewards, device=self._device)
-      lastgaelam = 0
-      for t in reversed(range(self._steps_per_batch)):
-        if t == self._steps_per_batch - 1:
-          nextvalues = next_value
-          next_acting = next_players
-        else:
-          nextvalues = values[t + 1]
-          next_acting = acting_players[t + 1]
+          advantages = torch.zeros_like(rewards, device=self._device)
+          lastgaelam = 0
+          for t in reversed(range(self._steps_per_batch)):
+            if t == self._steps_per_batch - 1:
+              nextvalues = next_value
+              next_acting = next_players
+            else:
+              nextvalues = values[t + 1]
+              next_acting = acting_players[t + 1]
 
-        self._player_sign_np[:] = np.where(
-            acting_players[t] == next_acting, 1.0, -1.0)
-        player_sign = torch.as_tensor(
-            self._player_sign_np, device=self._device)
+            self._player_sign_np[:] = np.where(
+                acting_players[t] == next_acting, 1.0, -1.0)
+            player_sign = torch.as_tensor(
+                self._player_sign_np, device=self._device)
 
-        nextnonterminal = 1.0 - dones[t]
-        delta = (rewards[t]
-                 + self._gamma * player_sign * nextvalues * nextnonterminal
-                 - values[t])
-        advantages[t] = lastgaelam = (
-            delta + self._gamma * self._gae_lambda
-            * nextnonterminal * player_sign * lastgaelam)
-      returns = advantages + values
+            nextnonterminal = 1.0 - dones[t]
+            delta = (rewards[t]
+                     + self._gamma * player_sign * nextvalues * nextnonterminal
+                     - values[t])
+            advantages[t] = lastgaelam = (
+                delta + self._gamma * self._gae_lambda
+                * nextnonterminal * player_sign * lastgaelam)
+          returns = advantages + values
 
-    b_obs = obs.reshape(-1, self._info_state_size)
-    b_logprobs = logprobs.reshape(-1)
-    b_actions = actions.reshape(-1)
-    b_advantages = advantages.reshape(-1)
-    b_returns = returns.reshape(-1)
-    b_values = values.reshape(-1)
-    b_legal_masks = legal_masks.reshape(-1, self._num_actions)
+      b_obs = obs.reshape(-1, self._info_state_size)
+      b_logprobs = logprobs.reshape(-1)
+      b_actions = actions.reshape(-1)
+      b_advantages = advantages.reshape(-1)
+      b_returns = returns.reshape(-1)
+      b_values = values.reshape(-1)
+      b_legal_masks = legal_masks.reshape(-1, self._num_actions)
 
-    self._run_ppo_epochs(b_obs, b_logprobs, b_actions, b_advantages,
-                         b_returns, b_values, b_legal_masks)
-    self.updates_done += 1
+      self._run_ppo_epochs(b_obs, b_logprobs, b_actions, b_advantages,
+                           b_returns, b_values, b_legal_masks)
+      self.updates_done += 1
+
+  def _wait_for_learn_buf(self, buf_idx):
+    """Wait for the learn thread on a specific buffer to complete."""
+    t = self._learn_threads[buf_idx]
+    if t is not None and t.is_alive():
+      t.join()
+    self._learn_threads[buf_idx] = None
 
   def _wait_for_learn(self):
-    """Wait for any in-progress async learn thread to complete."""
-    if self._learn_thread is not None and self._learn_thread.is_alive():
-      self._learn_thread.join()
-    self._learn_thread = None
+    """Wait for ALL in-progress async learn threads to complete."""
+    for i in range(2):
+      self._wait_for_learn_buf(i)
 
   def learn_raw(self, obs_np, players_np):
     """learn() variant that bootstraps from raw numpy arrays.
@@ -568,22 +576,25 @@ class NashPGAgent:
     next_players = players_np.copy()
 
     if self._async_learn:
-      # Wait for any previous async learn to finish
-      self._wait_for_learn()
+      cur = self._write_buf
+      other = 1 - cur
 
-      # Capture which buffer to learn from
-      learn_buf = self._buffers[self._write_buf]
+      # Wait for the learn thread that was using the OTHER buffer (from
+      # 2 updates ago). That buffer is about to become our write buffer,
+      # so it must be free.
+      self._wait_for_learn_buf(other)
 
-      # Launch learn in background thread
-      self._learn_thread = threading.Thread(
+      # Capture current buffer and launch learn in background thread
+      learn_buf = self._buffers[cur]
+      self._learn_threads[cur] = threading.Thread(
           target=self._gae_and_ppo,
           args=(learn_buf, next_obs, next_players),
           daemon=True)
-      self._learn_thread.start()
+      self._learn_threads[cur].start()
 
       # Swap to the other buffer for the next rollout
-      self._write_buf = 1 - self._write_buf
-      self._set_active_buffer(self._write_buf)
+      self._write_buf = other
+      self._set_active_buffer(other)
       self.cur_batch_idx = 0
     else:
       self._gae_and_ppo(None, next_obs, next_players)
@@ -616,23 +627,25 @@ class NashPGAgent:
     """
     ld = self._learn_device
     if ld is not None:
-      # Move networks and batch data to learn device
-      self._network.to(ld)
-      self._magnetic_network.to(ld)
-      b_obs = b_obs.to(ld)
-      b_logprobs = b_logprobs.to(ld)
-      b_actions = b_actions.to(ld)
-      b_advantages = b_advantages.to(ld)
-      b_returns = b_returns.to(ld)
-      b_values = b_values.to(ld)
-      b_legal_masks = b_legal_masks.to(ld)
+      with torch.profiler.record_function("to_learn_device"):
+        # Move networks and batch data to learn device
+        self._network.to(ld)
+        self._magnetic_network.to(ld)
+        b_obs = b_obs.to(ld)
+        b_logprobs = b_logprobs.to(ld)
+        b_actions = b_actions.to(ld)
+        b_advantages = b_advantages.to(ld)
+        b_returns = b_returns.to(ld)
+        b_values = b_values.to(ld)
+        b_legal_masks = b_legal_masks.to(ld)
 
-    with torch.inference_mode():
-      mag_logits = self._magnetic_network.get_policy_logits(b_obs)
-      mask_val = self._network.mask_value.to(b_obs.device)
-      mag_logits = torch.where(b_legal_masks, mag_logits, mask_val)
-      mag_log_probs = F.log_softmax(mag_logits, dim=-1)
-      mag_probs = F.softmax(mag_logits, dim=-1)
+    with torch.profiler.record_function("magnetic_logits"):
+      with torch.inference_mode():
+        mag_logits = self._magnetic_network.get_policy_logits(b_obs)
+        mask_val = self._network.mask_value.to(b_obs.device)
+        mag_logits = torch.where(b_legal_masks, mag_logits, mask_val)
+        mag_log_probs = F.log_softmax(mag_logits, dim=-1)
+        mag_probs = F.softmax(mag_logits, dim=-1)
 
     b_inds = np.arange(self._batch_size)
 
@@ -642,61 +655,62 @@ class NashPGAgent:
         end = start + self._minibatch_size
         mb = b_inds[start:end]
 
-        _, new_log_prob, entropy, new_value, new_probs = (
-            self._network.get_action_and_value(
-                b_obs[mb],
-                legal_actions_mask=b_legal_masks[mb],
-                action=b_actions[mb]))
+        with torch.profiler.record_function("ppo_minibatch"):
+          _, new_log_prob, entropy, new_value, new_probs = (
+              self._network.get_action_and_value(
+                  b_obs[mb],
+                  legal_actions_mask=b_legal_masks[mb],
+                  action=b_actions[mb]))
 
-        log_ratio = new_log_prob - b_logprobs[mb]
-        ratio = log_ratio.exp()
+          log_ratio = new_log_prob - b_logprobs[mb]
+          ratio = log_ratio.exp()
 
-        mb_advantages = b_advantages[mb]
-        if len(mb_advantages) > 1:
-          mb_advantages = (mb_advantages - mb_advantages.mean()) / (
-              mb_advantages.std() + 1e-8)
+          mb_advantages = b_advantages[mb]
+          if len(mb_advantages) > 1:
+            mb_advantages = (mb_advantages - mb_advantages.mean()) / (
+                mb_advantages.std() + 1e-8)
 
-        pg_loss1 = -mb_advantages * ratio
-        pg_loss2 = -mb_advantages * torch.clamp(
-            ratio, 1 - self._clip_coef, 1 + self._clip_coef)
-        pg_loss = torch.max(pg_loss1, pg_loss2).mean()
+          pg_loss1 = -mb_advantages * ratio
+          pg_loss2 = -mb_advantages * torch.clamp(
+              ratio, 1 - self._clip_coef, 1 + self._clip_coef)
+          pg_loss = torch.max(pg_loss1, pg_loss2).mean()
 
-        new_value = new_value.view(-1)
-        if self._clip_vloss:
-          v_loss_unclipped = (new_value - b_returns[mb]) ** 2
-          v_clipped = b_values[mb] + torch.clamp(
-              new_value - b_values[mb],
-              -self._clip_coef, self._clip_coef)
-          v_loss_clipped = (v_clipped - b_returns[mb]) ** 2
-          v_loss = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped).mean()
-        else:
-          v_loss = 0.5 * ((new_value - b_returns[mb]) ** 2).mean()
+          new_value = new_value.view(-1)
+          if self._clip_vloss:
+            v_loss_unclipped = (new_value - b_returns[mb]) ** 2
+            v_clipped = b_values[mb] + torch.clamp(
+                new_value - b_values[mb],
+                -self._clip_coef, self._clip_coef)
+            v_loss_clipped = (v_clipped - b_returns[mb]) ** 2
+            v_loss = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped).mean()
+          else:
+            v_loss = 0.5 * ((new_value - b_returns[mb]) ** 2).mean()
 
-        entropy_loss = entropy.mean()
+          entropy_loss = entropy.mean()
 
-        mb_mag_probs = mag_probs[mb]
-        mb_mag_log_probs = mag_log_probs[mb]
-        mb_legal = b_legal_masks[mb].float()
+          mb_mag_probs = mag_probs[mb]
+          mb_mag_log_probs = mag_log_probs[mb]
+          mb_legal = b_legal_masks[mb].float()
 
-        if self._magnetic_divergence == "kl":
-          new_log_probs_all = torch.log(new_probs + 1e-10)
-          kl = (new_probs * (new_log_probs_all - mb_mag_log_probs) *
-                mb_legal).sum(dim=-1)
-          mag_loss = kl.mean()
-        else:
-          l2 = 0.5 * ((new_probs - mb_mag_probs) ** 2 * mb_legal).sum(dim=-1)
-          mag_loss = l2.mean()
+          if self._magnetic_divergence == "kl":
+            new_log_probs_all = torch.log(new_probs + 1e-10)
+            kl = (new_probs * (new_log_probs_all - mb_mag_log_probs) *
+                  mb_legal).sum(dim=-1)
+            mag_loss = kl.mean()
+          else:
+            l2 = 0.5 * ((new_probs - mb_mag_probs) ** 2 * mb_legal).sum(dim=-1)
+            mag_loss = l2.mean()
 
-        loss = (pg_loss
-                - self._entropy_cost * entropy_loss
-                + self._value_coef * v_loss
-                + self._magnetic_cost * mag_loss)
+          loss = (pg_loss
+                  - self._entropy_cost * entropy_loss
+                  + self._value_coef * v_loss
+                  + self._magnetic_cost * mag_loss)
 
-        self._optimizer.zero_grad()
-        loss.backward()
-        nn.utils.clip_grad_norm_(
-            self._network.parameters(), self._max_grad_norm)
-        self._optimizer.step()
+          self._optimizer.zero_grad()
+          loss.backward()
+          nn.utils.clip_grad_norm_(
+              self._network.parameters(), self._max_grad_norm)
+          self._optimizer.step()
 
     self._last_pg_loss = pg_loss.item()
     self._last_v_loss = v_loss.item()
@@ -704,13 +718,15 @@ class NashPGAgent:
     self._last_entropy = entropy_loss.item()
 
     if ld is not None:
-      # Move networks back to rollout device
-      self._network.to(self._device)
-      self._magnetic_network.to(self._device)
+      with torch.profiler.record_function("to_rollout_device"):
+        # Move networks back to rollout device
+        self._network.to(self._device)
+        self._magnetic_network.to(self._device)
 
     # Sync inference network (async + learn_device mode)
     if self._inference_network is not None:
-      self._inference_network.load_state_dict(self._network.state_dict())
+      with torch.profiler.record_function("sync_inference_net"):
+        self._inference_network.load_state_dict(self._network.state_dict())
 
   def set_learning_rate(self, lr):
     """Update the optimizer's learning rate."""
