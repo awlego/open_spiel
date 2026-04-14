@@ -319,9 +319,9 @@ def run_convergence_benchmark(envs, agent, game, config):
   outer_step = 0
 
   for update in range(1, total_updates + 1):
-    # Linear LR decay
+    # Linear LR decay (to 10% of initial, not 0)
     if FLAGS.lr_decay:
-      frac = 1.0 - (update - 1) / total_updates
+      frac = 1.0 - 0.9 * (update - 1) / total_updates
       agent.set_learning_rate(FLAGS.learning_rate * frac)
 
     # Collect rollout

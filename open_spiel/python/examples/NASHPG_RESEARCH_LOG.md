@@ -225,8 +225,21 @@ Priority reordered based on profiling. With async+MPS, the bottleneck is agent.s
 - **Notes**: Earlier impression of improvement was misleading (contended CPU run). The default lr=3e-4 is well-tuned for 512x512 network.
 
 ### O. Learning Rate Decay
-- **Status**: TESTING -- linear decay from lr=3e-4 → 0 over total updates
-- **Notes**: Standard PPO practice from CleanRL. May help convergence in later stages when the policy should change less aggressively.
+- **Status**: DONE (v1), TESTING (v2 with 10% floor)
+- **v1 Result (3e-4 → 0, 3000 updates)**: BETTER from 1000-2500 updates, then regresses.
+  - Update 2500: score=-10.8, 39.0% WR vs baseline -13.9, 36.3% -- **significant improvement!**
+  - Update 3000: score=-11.5, 36.5% vs baseline -10.5, 39.8% -- worse (LR decayed to 0, lost learning ability)
+- **Key insight**: NashPG needs non-zero LR for the magnetic outer loop to work. Decaying to 0 breaks the algorithm's monotonic improvement guarantee.
+- **v2 Result (3e-4 → 3e-5, 5000 updates)**: Roughly equivalent to baseline. Score -8.1 (41.1% WR) vs baseline -8.4 (42.0% WR) at 5000 updates. Slightly worse in middle, catches up by end.
+- **v3 (5e-4 → 5e-5, 5000 updates)**: TESTING. Combines higher initial LR for faster early convergence with decay for late stability.
+- **Notes**: LR decay helps mid-training convergence but must not go to 0. The 10% floor preserves NashPG's magnetic outer loop.
+
+### P. Entropy Schedule / Higher Entropy
+- **Expected impact**: POTENTIALLY POSITIVE for convergence quality
+- **Effort**: LOW
+- **Research finding**: For imperfect-info games, entropy coefficients of 0.05-0.2 are optimal (higher than single-agent PPO defaults of 0-0.01). Our current 0.05 is at the low end.
+- **Risk**: Dynamic decay schedules can hurt by suppressing early-turn exploration.
+- **To test**: entropy=0.1 for 3000+ updates, or entropy=0.1 + lr_decay combo.
 
 ### M. C++ BatchStepper (in pyspiel module)
 - **Status**: CODE WRITTEN, ABI ISSUE
@@ -252,3 +265,10 @@ Priority reordered based on profiling. With async+MPS, the bottleneck is agent.s
 - RLinf: https://github.com/RLinf/RLinf (arxiv:2509.15965) -- elastic pipelining for RL
 - Apple Silicon ML profiling: arxiv:2501.14925
 - PyTorch MPS guide: https://developer.apple.com/metal/pytorch/
+- Best-iterate PG for imperfect-info games (ICLR 2025): arxiv:2408.00751
+  - Uses depth-dependent learning rates (higher LR deeper in tree)
+  - Bidilated regularizer for EFGs
+  - Trajectory Q-values for efficient estimation without importance sampling
+- Fast extragradient for competitive games with entropy reg: acm:3722577.3722581
+  - Linear convergence rate for entropy-regularized zero-sum games
+  - Dimension-free convergence (independent of state/action space size)
