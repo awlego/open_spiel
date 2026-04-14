@@ -77,6 +77,9 @@ flags.DEFINE_float("entropy_cost", 0.05, "Entropy bonus coefficient.")
 flags.DEFINE_float("magnetic_cost", 0.2, "Magnetic regularization coefficient.")
 flags.DEFINE_integer("outer_loop_every", 100,
                      "Updates between magnetic reference updates.")
+flags.DEFINE_string("device", "cpu", "Torch device for rollout (cpu, mps).")
+flags.DEFINE_string("learn_device", None,
+                    "Torch device for learn() only (e.g. mps). None = same as device.")
 flags.DEFINE_integer("seed", 42, "Random seed.")
 
 # Convergence mode flags.
@@ -432,6 +435,8 @@ def _create_envs_and_agent():
       learning_rate=FLAGS.learning_rate,
       entropy_cost=FLAGS.entropy_cost,
       magnetic_cost=FLAGS.magnetic_cost,
+      device=FLAGS.device,
+      learn_device=FLAGS.learn_device,
   )
 
   return envs, agent, game
@@ -454,6 +459,8 @@ def _build_config():
       "magnetic_cost": FLAGS.magnetic_cost,
       "outer_loop_every": FLAGS.outer_loop_every,
       "seed": FLAGS.seed,
+      "device": FLAGS.device,
+      "learn_device": FLAGS.learn_device,
   }
 
 

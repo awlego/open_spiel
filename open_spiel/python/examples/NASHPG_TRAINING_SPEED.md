@@ -168,6 +168,9 @@ See `NASHPG_RESEARCH_LOG.md` for the full list of ideas with detailed descriptio
 | 2026-04-13 | 512x512 baseline | 7,124 | -- | SyncVectorEnv, 64 envs, 128 steps, no raw path |
 | 2026-04-13 | raw + 6 workers | 14,196 | **+99%** | Raw array path + SubprocVectorEnv. learn() becomes 58% of time. |
 | 2026-04-13 | raw + 6w + JIT + GAE | 13,850 | +94% | JIT trace + vectorized GAE: no measurable benefit with 512x512. |
+| 2026-04-13 | torch.compile | 14,574 | +104% | Marginal (+2.7% over raw+6w). Better than 128x128 but still small. |
+| 2026-04-13 | MPS GPU (full) | 8,510 | +19% | Slower overall. learn() faster (-24%) but agent.step() killed by transfers. |
+| 2026-04-13 | **MPS learn-only** | **16,840** | **+136%** | **learn() on MPS GPU, rollout on CPU. learn() -28%. New best.** |
 
 ### Previous experiments (128x128 network, archived)
 

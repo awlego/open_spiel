@@ -30,6 +30,22 @@ targeting learn() (PPO forward+backward passes) will have the highest impact.
 - **Result**: 14,196 → 13,850 steps/s (-2.4%, within noise)
 - **Notes**: These optimized agent.step() and GAE, which are now <22% of total time. The JIT trace and vectorized GAE code is still in place (correct practice, no harm) but doesn't move the needle with the larger network.
 
+### 3. torch.compile (512x512 retest)
+- **Status**: DONE - Marginal improvement
+- **Result**: 14,196 → 14,574 steps/s (+2.7%)
+- **Notes**: learn() went from 3.33s to 3.17s (-5%). Better than on 128x128 (1.02x) but still not significant.
+
+### 4. MPS GPU (full -- 512x512 retest)
+- **Status**: DONE - Still slower overall
+- **Result**: 14,196 → 8,510 steps/s (-40%)
+- **Notes**: agent.step() exploded to 53% due to CPU↔MPS transfer per step. BUT learn() dropped from 3.33s to 2.52s (-24%). This led to the "MPS learn-only" experiment.
+
+### 5. MPS for learn() Only
+- **Status**: DONE - SIGNIFICANT WIN (+18.6%)
+- **Result**: 14,196 → 16,840 steps/s (+18.6%)
+- **Notes**: Rollout stays on CPU, only PPO epochs run on MPS GPU. learn() went from 3.33s to 2.39s (-28%). Unified memory makes the CPU↔MPS data transfer nearly free. New best config.
+- **Implementation**: Added `learn_device` parameter to NashPGAgent and `--learn_device` flag to benchmark. Also refactored learn()/learn_raw() to share a single `_run_ppo_epochs()` method.
+
 ## Ideas To Test
 
 Priority is reordered for 512x512 where learn() is the dominant bottleneck (58% of time).

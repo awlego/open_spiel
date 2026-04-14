@@ -138,7 +138,8 @@ class NashPGAgent:
                update_epochs=4,
                num_minibatches=4,
                max_grad_norm=0.5,
-               device="cpu"):
+               device="cpu",
+               learn_device=None):
     """Initialize the NashPG agent.
 
     Args:
@@ -184,6 +185,7 @@ class NashPGAgent:
     self._num_minibatches = num_minibatches
     self._max_grad_norm = max_grad_norm
     self._device = torch.device(device)
+    self._learn_device = torch.device(learn_device) if learn_device else None
 
     self._batch_size = num_envs * steps_per_batch
     self._minibatch_size = max(1, self._batch_size // num_minibatches)
@@ -200,16 +202,6 @@ class NashPGAgent:
     self._magnetic_network.eval()
     for p in self._magnetic_network.parameters():
       p.requires_grad = False
-
-    # JIT-trace actor and critic for faster inference.
-    # Only the actor/critic Sequential modules are traced (no control flow).
-    dummy_obs = torch.zeros((num_envs, info_state_size), device=self._device)
-    self._network.actor = torch.jit.trace(self._network.actor, dummy_obs)
-    self._network.critic = torch.jit.trace(self._network.critic, dummy_obs)
-    self._magnetic_network.actor = torch.jit.trace(
-        self._magnetic_network.actor, dummy_obs)
-    self._magnetic_network.critic = torch.jit.trace(
-        self._magnetic_network.critic, dummy_obs)
 
     self._optimizer = optim.Adam(
         self._network.parameters(), lr=learning_rate, eps=1e-5)
@@ -382,9 +374,10 @@ class NashPGAgent:
     acting = self._acting_players[self.cur_batch_idx]
     # Extract reward for the player who acted
     r_np = rewards_np[np.arange(self._num_envs), acting].astype(np.float32)
-    self.rewards[self.cur_batch_idx] = torch.from_numpy(r_np)
-    self.dones[self.cur_batch_idx] = torch.from_numpy(
-        dones_np.astype(np.float32))
+    self.rewards[self.cur_batch_idx] = torch.as_tensor(
+        r_np, device=self._device)
+    self.dones[self.cur_batch_idx] = torch.as_tensor(
+        dones_np.astype(np.float32), device=self._device)
     self.total_steps_done += self._num_envs
     self.cur_batch_idx += 1
 
@@ -414,7 +407,8 @@ class NashPGAgent:
         # Vectorized player_sign: +1 same player, -1 different (zero-sum)
         self._player_sign_np[:] = np.where(
             self._acting_players[t] == next_acting, 1.0, -1.0)
-        player_sign = torch.from_numpy(self._player_sign_np)
+        player_sign = torch.as_tensor(
+            self._player_sign_np, device=self._device)
 
         nextnonterminal = 1.0 - self.dones[t]
         delta = (self.rewards[t]
@@ -434,81 +428,8 @@ class NashPGAgent:
     b_values = self.values.reshape(-1)
     b_legal_masks = self.legal_actions_mask.reshape(-1, self._num_actions)
 
-    with torch.inference_mode():
-      mag_logits = self._magnetic_network.get_policy_logits(b_obs)
-      mag_logits = torch.where(
-          b_legal_masks, mag_logits, self._network.mask_value)
-      mag_log_probs = F.log_softmax(mag_logits, dim=-1)
-      mag_probs = F.softmax(mag_logits, dim=-1)
-
-    b_inds = np.arange(self._batch_size)
-
-    for _ in range(self._update_epochs):
-      np.random.shuffle(b_inds)
-      for start in range(0, self._batch_size, self._minibatch_size):
-        end = start + self._minibatch_size
-        mb = b_inds[start:end]
-
-        _, new_log_prob, entropy, new_value, new_probs = (
-            self._network.get_action_and_value(
-                b_obs[mb],
-                legal_actions_mask=b_legal_masks[mb],
-                action=b_actions[mb]))
-
-        log_ratio = new_log_prob - b_logprobs[mb]
-        ratio = log_ratio.exp()
-
-        mb_advantages = b_advantages[mb]
-        if len(mb_advantages) > 1:
-          mb_advantages = (mb_advantages - mb_advantages.mean()) / (
-              mb_advantages.std() + 1e-8)
-
-        pg_loss1 = -mb_advantages * ratio
-        pg_loss2 = -mb_advantages * torch.clamp(
-            ratio, 1 - self._clip_coef, 1 + self._clip_coef)
-        pg_loss = torch.max(pg_loss1, pg_loss2).mean()
-
-        new_value = new_value.view(-1)
-        if self._clip_vloss:
-          v_loss_unclipped = (new_value - b_returns[mb]) ** 2
-          v_clipped = b_values[mb] + torch.clamp(
-              new_value - b_values[mb],
-              -self._clip_coef, self._clip_coef)
-          v_loss_clipped = (v_clipped - b_returns[mb]) ** 2
-          v_loss = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped).mean()
-        else:
-          v_loss = 0.5 * ((new_value - b_returns[mb]) ** 2).mean()
-
-        entropy_loss = entropy.mean()
-
-        mb_mag_probs = mag_probs[mb]
-        mb_mag_log_probs = mag_log_probs[mb]
-        mb_legal = b_legal_masks[mb].float()
-
-        if self._magnetic_divergence == "kl":
-          new_log_probs_all = torch.log(new_probs + 1e-10)
-          kl = (new_probs * (new_log_probs_all - mb_mag_log_probs) *
-                mb_legal).sum(dim=-1)
-          mag_loss = kl.mean()
-        else:
-          l2 = 0.5 * ((new_probs - mb_mag_probs) ** 2 * mb_legal).sum(dim=-1)
-          mag_loss = l2.mean()
-
-        loss = (pg_loss
-                - self._entropy_cost * entropy_loss
-                + self._value_coef * v_loss
-                + self._magnetic_cost * mag_loss)
-
-        self._optimizer.zero_grad()
-        loss.backward()
-        nn.utils.clip_grad_norm_(
-            self._network.parameters(), self._max_grad_norm)
-        self._optimizer.step()
-
-    self._last_pg_loss = pg_loss.item()
-    self._last_v_loss = v_loss.item()
-    self._last_mag_loss = mag_loss.item()
-    self._last_entropy = entropy_loss.item()
+    self._run_ppo_epochs(b_obs, b_logprobs, b_actions, b_advantages,
+                         b_returns, b_values, b_legal_masks)
 
     self.cur_batch_idx = 0
     self.updates_done += 1
@@ -552,7 +473,8 @@ class NashPGAgent:
         # Vectorized player_sign: +1 same player, -1 different (zero-sum)
         self._player_sign_np[:] = np.where(
             self._acting_players[t] == next_acting, 1.0, -1.0)
-        player_sign = torch.from_numpy(self._player_sign_np)
+        player_sign = torch.as_tensor(
+            self._player_sign_np, device=self._device)
 
         nextnonterminal = 1.0 - self.dones[t]
         delta = (self.rewards[t]
@@ -572,11 +494,37 @@ class NashPGAgent:
     b_values = self.values.reshape(-1)
     b_legal_masks = self.legal_actions_mask.reshape(-1, self._num_actions)
 
-    # Get magnetic policy log-probs (frozen, no grad)
+    self._run_ppo_epochs(b_obs, b_logprobs, b_actions, b_advantages,
+                         b_returns, b_values, b_legal_masks)
+
+    # Reset for next rollout
+    self.cur_batch_idx = 0
+    self.updates_done += 1
+
+  def _run_ppo_epochs(self, b_obs, b_logprobs, b_actions, b_advantages,
+                      b_returns, b_values, b_legal_masks):
+    """Run PPO epochs with magnetic regularization.
+
+    Optionally moves networks and data to learn_device for faster compute,
+    then moves back afterward.
+    """
+    ld = self._learn_device
+    if ld is not None:
+      # Move networks and batch data to learn device
+      self._network.to(ld)
+      self._magnetic_network.to(ld)
+      b_obs = b_obs.to(ld)
+      b_logprobs = b_logprobs.to(ld)
+      b_actions = b_actions.to(ld)
+      b_advantages = b_advantages.to(ld)
+      b_returns = b_returns.to(ld)
+      b_values = b_values.to(ld)
+      b_legal_masks = b_legal_masks.to(ld)
+
     with torch.inference_mode():
       mag_logits = self._magnetic_network.get_policy_logits(b_obs)
-      mag_logits = torch.where(
-          b_legal_masks, mag_logits, self._network.mask_value)
+      mask_val = self._network.mask_value.to(b_obs.device)
+      mag_logits = torch.where(b_legal_masks, mag_logits, mask_val)
       mag_log_probs = F.log_softmax(mag_logits, dim=-1)
       mag_probs = F.softmax(mag_logits, dim=-1)
 
@@ -594,23 +542,19 @@ class NashPGAgent:
                 legal_actions_mask=b_legal_masks[mb],
                 action=b_actions[mb]))
 
-        # Importance sampling ratio
         log_ratio = new_log_prob - b_logprobs[mb]
         ratio = log_ratio.exp()
 
-        # Normalize advantages
         mb_advantages = b_advantages[mb]
         if len(mb_advantages) > 1:
           mb_advantages = (mb_advantages - mb_advantages.mean()) / (
               mb_advantages.std() + 1e-8)
 
-        # PPO clipped policy loss
         pg_loss1 = -mb_advantages * ratio
         pg_loss2 = -mb_advantages * torch.clamp(
             ratio, 1 - self._clip_coef, 1 + self._clip_coef)
         pg_loss = torch.max(pg_loss1, pg_loss2).mean()
 
-        # Value loss
         new_value = new_value.view(-1)
         if self._clip_vloss:
           v_loss_unclipped = (new_value - b_returns[mb]) ** 2
@@ -622,26 +566,21 @@ class NashPGAgent:
         else:
           v_loss = 0.5 * ((new_value - b_returns[mb]) ** 2).mean()
 
-        # Entropy bonus
         entropy_loss = entropy.mean()
 
-        # Magnetic regularization
         mb_mag_probs = mag_probs[mb]
         mb_mag_log_probs = mag_log_probs[mb]
         mb_legal = b_legal_masks[mb].float()
 
         if self._magnetic_divergence == "kl":
-          # KL(current || magnetic) over legal actions
           new_log_probs_all = torch.log(new_probs + 1e-10)
           kl = (new_probs * (new_log_probs_all - mb_mag_log_probs) *
                 mb_legal).sum(dim=-1)
           mag_loss = kl.mean()
         else:
-          # L2 divergence over legal actions
           l2 = 0.5 * ((new_probs - mb_mag_probs) ** 2 * mb_legal).sum(dim=-1)
           mag_loss = l2.mean()
 
-        # Total loss
         loss = (pg_loss
                 - self._entropy_cost * entropy_loss
                 + self._value_coef * v_loss
@@ -658,9 +597,10 @@ class NashPGAgent:
     self._last_mag_loss = mag_loss.item()
     self._last_entropy = entropy_loss.item()
 
-    # Reset for next rollout
-    self.cur_batch_idx = 0
-    self.updates_done += 1
+    if ld is not None:
+      # Move networks back to rollout device
+      self._network.to(self._device)
+      self._magnetic_network.to(self._device)
 
   def update_magnetic_reference(self):
     """Update the magnetic reference policy by cloning the current network."""
