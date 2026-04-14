@@ -18,6 +18,11 @@ Uses a single shared agent with SyncVectorEnv for parallel self-play.
 Always uses enriched observations (enriched_obs=true, 517-dim tensor).
 
 Usage:
+  # Fast training (recommended: raw path + async learn on MPS GPU + 6 workers)
+  PYTHONPATH=. env3.12/bin/python open_spiel/python/examples/nash_pg_lost_cities_v2_pytorch.py \
+    --use_raw --num_workers=6 --async_learn --learn_device=mps
+
+  # Basic training (no acceleration)
   PYTHONPATH=. env3.12/bin/python open_spiel/python/examples/nash_pg_lost_cities_v2_pytorch.py
 
 Monitor training:
@@ -25,6 +30,7 @@ Monitor training:
 
 Resume from checkpoint:
   PYTHONPATH=. env3.12/bin/python open_spiel/python/examples/nash_pg_lost_cities_v2_pytorch.py \
+    --use_raw --num_workers=6 --async_learn --learn_device=mps \
     --checkpoint_dir=checkpoints/lost_cities_nash_pg
 """
 
@@ -86,6 +92,13 @@ flags.DEFINE_integer("outer_loop_every", 100,
 flags.DEFINE_integer("num_workers", 1,
                      "Number of worker processes for env simulation. "
                      "1 = synchronous (no subprocesses). Max 6.")
+flags.DEFINE_bool("use_raw", False,
+                  "Use raw array step path (bypass TimeStep construction).")
+flags.DEFINE_string("learn_device", None,
+                    "Torch device for learn() only (e.g. 'mps'). "
+                    "None = same as CPU.")
+flags.DEFINE_bool("async_learn", False,
+                  "Enable async double-buffered learning.")
 flags.DEFINE_integer("seed", 42, "Random seed.")
 flags.DEFINE_string("logdir", "runs/lost_cities_nash_pg",
                     "TensorBoard log directory.")
@@ -404,6 +417,8 @@ def main(unused_argv):
       gae_lambda=FLAGS.gae_lambda,
       update_epochs=FLAGS.update_epochs,
       num_minibatches=FLAGS.num_minibatches,
+      learn_device=FLAGS.learn_device,
+      async_learn=FLAGS.async_learn,
   )
 
   # Resume from checkpoint if available
@@ -412,7 +427,12 @@ def main(unused_argv):
 
   writer = SummaryWriter(FLAGS.logdir)
   eval_rng = np.random.RandomState(FLAGS.seed + 1)
-  game = envs.envs[0]._game  # pylint: disable=protected-access
+  if hasattr(envs, 'envs'):
+    game = envs.envs[0]._game  # pylint: disable=protected-access
+  else:
+    _tmp = _make_env()
+    game = _tmp._game  # pylint: disable=protected-access
+    del _tmp
 
   remaining = FLAGS.total_updates - start_update
   logging.info("Training updates %d to %d (%d remaining)...",
@@ -420,20 +440,32 @@ def main(unused_argv):
 
   t_start = time.time()
 
-  time_steps = envs.reset()
+  use_raw = FLAGS.use_raw
+  if use_raw:
+    obs, mask, players = envs.reset_raw()
+  else:
+    time_steps = envs.reset()
   for update in range(start_update, FLAGS.total_updates):
     # Collect rollout
-    for _ in range(FLAGS.num_steps):
-      agent_output = agent.step(time_steps)
-      time_steps, rewards, dones, unreset_ts = envs.step(
-          agent_output, reset_if_done=True)
-      agent.post_step(rewards, dones)
-
-    # Learn from collected data
-    agent.learn(time_steps)
+    if use_raw:
+      for _ in range(FLAGS.num_steps):
+        actions = agent.step_raw(obs, mask, players)
+        obs, mask, players, rewards, dones = envs.step_raw(
+            actions, reset_if_done=True)
+        agent.post_step_raw(rewards, dones, players)
+      agent.learn_raw(obs, players)
+    else:
+      for _ in range(FLAGS.num_steps):
+        agent_output = agent.step(time_steps)
+        time_steps, rewards, dones, unreset_ts = envs.step(
+            agent_output, reset_if_done=True)
+        agent.post_step(rewards, dones)
+      agent.learn(time_steps)
 
     # Outer loop: update magnetic reference
     if (update + 1) % FLAGS.outer_loop_every == 0:
+      if hasattr(agent, '_wait_for_learn'):
+        agent._wait_for_learn()
       agent.update_magnetic_reference()
       outer_step += 1
       writer.add_scalar("nash_pg/outer_step", outer_step,
@@ -442,6 +474,8 @@ def main(unused_argv):
 
     # Evaluate periodically
     if (update + 1) % FLAGS.eval_every == 0:
+      if hasattr(agent, '_wait_for_learn'):
+        agent._wait_for_learn()
       elapsed = time.time() - t_start
       steps_per_sec = agent.total_steps_done / elapsed
 
@@ -507,10 +541,14 @@ def main(unused_argv):
 
     # Save checkpoints periodically
     if (update + 1) % FLAGS.checkpoint_every == 0:
+      if hasattr(agent, '_wait_for_learn'):
+        agent._wait_for_learn()
       save_checkpoint(agent, FLAGS.checkpoint_dir, update + 1, outer_step,
                       best_committer_wr)
 
   # Final checkpoint and evaluation
+  if hasattr(agent, '_wait_for_learn'):
+    agent._wait_for_learn()
   save_checkpoint(agent, FLAGS.checkpoint_dir, FLAGS.total_updates, outer_step,
                   best_committer_wr)
 
