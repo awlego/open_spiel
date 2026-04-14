@@ -591,6 +591,8 @@ def main_throughput(envs, agent, config):
       # Only profile the first run
       profiler.stop()
       profiler.export_chrome_trace(FLAGS.profile)
+      # Inject background learn thread events into the trace
+      agent.inject_bg_trace_events(FLAGS.profile)
       logging.info("Chrome trace written to %s", FLAGS.profile)
       profiler = None
 

@@ -274,6 +274,8 @@ class NashPGAgent:
     # Async learn: double-buffered rollout with background learn thread
     self._async_learn = async_learn
     self._learn_threads = [None, None]  # one learn thread per buffer
+    # Background thread trace events (torch.profiler can't see bg threads)
+    self._bg_trace_events = []
     self._inference_network = None
     if async_learn:
       # Allocate a second set of rollout buffers
@@ -492,6 +494,9 @@ class NashPGAgent:
     This is the core learn logic, factored out so it can run either
     synchronously or in a background thread (async mode).
     """
+    import time as _time
+    _t_start = _time.perf_counter()
+    _tid = threading.get_ident()
     with torch.profiler.record_function("gae_and_ppo"):
       obs = buf["obs"] if isinstance(buf, dict) else self.obs
       actions = buf["actions"] if isinstance(buf, dict) else self.actions
@@ -555,9 +560,59 @@ class NashPGAgent:
       b_values = values.reshape(-1)
       b_legal_masks = legal_masks.reshape(-1, self._num_actions)
 
+      _t_ppo_start = _time.perf_counter()
       self._run_ppo_epochs(b_obs, b_logprobs, b_actions, b_advantages,
                            b_returns, b_values, b_legal_masks)
+      _t_end = _time.perf_counter()
       self.updates_done += 1
+      # Record trace events for background thread visibility
+      self._bg_trace_events.append({
+          "name": "learn_thread", "tid": _tid,
+          "ts": _t_start, "dur": _t_end - _t_start})
+      self._bg_trace_events.append({
+          "name": "gae_compute_bg", "tid": _tid,
+          "ts": _t_start, "dur": _t_ppo_start - _t_start})
+      self._bg_trace_events.append({
+          "name": "ppo_epochs_bg", "tid": _tid,
+          "ts": _t_ppo_start, "dur": _t_end - _t_ppo_start})
+
+  def inject_bg_trace_events(self, trace_path):
+    """Inject background learn thread events into a Chrome trace file.
+
+    torch.profiler can't capture events from background threads on macOS.
+    This post-processes the trace to add learn thread timing, making
+    async overlap visible in Perfetto/chrome://tracing.
+    """
+    import json as _json
+    with open(trace_path) as f:
+      data = _json.load(f)
+    events = data if isinstance(data, list) else data.get("traceEvents", [])
+    # Find the base timestamp from the profiler
+    base_ts = min(
+        (e["ts"] for e in events if e.get("ph") == "X"), default=0)
+    # Convert perf_counter timestamps to profiler microseconds
+    if not self._bg_trace_events:
+      return
+    bg_base = min(e["ts"] for e in self._bg_trace_events)
+    for e in self._bg_trace_events:
+      events.append({
+          "ph": "X",
+          "name": e["name"],
+          "cat": "learn_thread",
+          "tid": f"learn_thread_{e['tid']}",
+          "pid": events[0].get("pid", 0) if events else 0,
+          "ts": base_ts + (e["ts"] - bg_base) * 1e6,
+          "dur": e["dur"] * 1e6,
+      })
+    # Add thread name metadata
+    learn_tids = set(f"learn_thread_{e['tid']}" for e in self._bg_trace_events)
+    for tid in learn_tids:
+      events.append({
+          "ph": "M", "name": "thread_name",
+          "pid": events[0].get("pid", 0), "tid": tid,
+          "args": {"name": "Learn Thread"}})
+    with open(trace_path, "w") as f:
+      _json.dump(data, f)
 
   def _wait_for_learn_buf(self, buf_idx):
     """Wait for the learn thread on a specific buffer to complete."""
