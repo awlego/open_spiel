@@ -258,7 +258,12 @@ Priority reordered based on profiling. With async+MPS, the bottleneck is agent.s
   - 3.1% WR improvement, 3.4 score improvement over baseline
   - Wall-clock 1886s (+8% vs baseline due to LayerNorm overhead)
   - Best update 4500: score=-4.8 (44.6% WR)
-- **Config**: `--learning_rate=5e-4 --lr_decay --outer_loop_every=50 --layer_norm`
+- **10k update result**: score=-2.8 (**46.8% WR**) at 10k, peak **47.5% WR** at 9k
+- **20k update result**: score=+3.1 (**53.0% WR**) at 20k -- **SURPASSES COMMITTERBOT!**
+  - First beats CommitterBot at 18k updates (52.0% WR, score +3.2, 107 min)
+  - Sustained advantage at 20k (53.0% WR, 119 min)
+  - Progression: 36%→41%→46%→49%→53% WR over 20k updates
+- **Config**: `--learning_rate=5e-4 --lr_decay --outer_loop_every=50 --layer_norm --raw_worker`
 - **Why it works**: Higher LR for fast early convergence, decay for stability, frequent magnetic updates for exploration, LayerNorm for training stability
 
 ### R. Outer Loop Frequency (outer_loop_every=50)
