@@ -40,7 +40,17 @@ targeting learn() (PPO forward+backward passes) will have the highest impact.
 - **Result**: 14,196 → 8,510 steps/s (-40%)
 - **Notes**: agent.step() exploded to 53% due to CPU↔MPS transfer per step. BUT learn() dropped from 3.33s to 2.52s (-24%). This led to the "MPS learn-only" experiment.
 
-### 5. MPS for learn() Only
+### 5. Async Double-Buffered Learn (CPU)
+- **Status**: DONE - SIGNIFICANT WIN (+33%)
+- **Result**: 14,196 → 18,881 steps/s (+33%)
+- **Notes**: Two rollout buffer sets, learn() runs in background thread while next rollout collects. On CPU, the GIL contention is noticeable (agent.step() inflated to 41%) but overall throughput improves because learn() is overlapped. Cannot combine with MPS learn_device due to network device race condition (see below).
+- **Implementation**: Added `async_learn` parameter and `--async_learn` flag. Double buffers swap each update.
+
+### 6. Async + MPS Learn
+- **Status**: BLOCKED - race condition
+- **Notes**: When async learn moves network to MPS in background thread, the main thread's step_raw() fails because it expects CPU network. Would need a shadow network copy or separate inference/training networks to fix. CPU async (+33%) is already a bigger win than sync MPS learn (+18.6%).
+
+### 7. MPS for learn() Only (sync)
 - **Status**: DONE - SIGNIFICANT WIN (+18.6%)
 - **Result**: 14,196 → 16,840 steps/s (+18.6%)
 - **Notes**: Rollout stays on CPU, only PPO epochs run on MPS GPU. learn() went from 3.33s to 2.39s (-28%). Unified memory makes the CPU↔MPS data transfer nearly free. New best config.

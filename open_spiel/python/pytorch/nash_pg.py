@@ -36,6 +36,7 @@ Usage:
 
 import copy
 import os
+import threading
 
 from absl import logging
 import numpy as np
@@ -139,7 +140,8 @@ class NashPGAgent:
                num_minibatches=4,
                max_grad_norm=0.5,
                device="cpu",
-               learn_device=None):
+               learn_device=None,
+               async_learn=False):
     """Initialize the NashPG agent.
 
     Args:
@@ -240,11 +242,63 @@ class NashPGAgent:
     self.total_steps_done = 0
     self.updates_done = 0
 
+    # Async learn: double-buffered rollout with background learn thread
+    self._async_learn = async_learn
+    self._learn_thread = None
+    if async_learn:
+      # Allocate a second set of rollout buffers
+      self._buffers = [
+          self._make_buffer_set(steps_per_batch, num_envs, info_state_size,
+                                num_actions),
+          self._make_buffer_set(steps_per_batch, num_envs, info_state_size,
+                                num_actions),
+      ]
+      self._write_buf = 0
+      # Point the main buffer attributes at buffer 0
+      self._set_active_buffer(0)
+
     # Loss tracking
     self._last_pg_loss = None
     self._last_v_loss = None
     self._last_mag_loss = None
     self._last_entropy = None
+
+  def _make_buffer_set(self, steps_per_batch, num_envs, info_state_size,
+                       num_actions):
+    """Allocate a complete set of rollout buffers."""
+    return {
+        "obs": torch.zeros(
+            (steps_per_batch, num_envs, info_state_size),
+            device=self._device),
+        "actions": torch.zeros(
+            (steps_per_batch, num_envs), dtype=torch.long,
+            device=self._device),
+        "logprobs": torch.zeros(
+            (steps_per_batch, num_envs), device=self._device),
+        "rewards": torch.zeros(
+            (steps_per_batch, num_envs), device=self._device),
+        "dones": torch.zeros(
+            (steps_per_batch, num_envs), device=self._device),
+        "values": torch.zeros(
+            (steps_per_batch, num_envs), device=self._device),
+        "legal_actions_mask": torch.zeros(
+            (steps_per_batch, num_envs, num_actions),
+            dtype=torch.bool, device=self._device),
+        "acting_players": np.zeros(
+            (steps_per_batch, num_envs), dtype=np.int32),
+    }
+
+  def _set_active_buffer(self, buf_idx):
+    """Point main buffer attributes at the specified buffer set."""
+    buf = self._buffers[buf_idx]
+    self.obs = buf["obs"]
+    self.actions = buf["actions"]
+    self.logprobs = buf["logprobs"]
+    self.rewards = buf["rewards"]
+    self.dones = buf["dones"]
+    self.values = buf["values"]
+    self.legal_actions_mask = buf["legal_actions_mask"]
+    self._acting_players = buf["acting_players"]
 
   @property
   def loss(self):
@@ -381,58 +435,98 @@ class NashPGAgent:
     self.total_steps_done += self._num_envs
     self.cur_batch_idx += 1
 
-  def learn_raw(self, obs_np, players_np):
-    """learn() variant that bootstraps from raw numpy arrays.
+  def _gae_and_ppo(self, buf, next_obs, next_players):
+    """Run GAE computation and PPO epochs on the given buffer set.
 
-    Args:
-      obs_np: [num_envs, info_state_size] float32 numpy array.
-      players_np: [num_envs] int32 numpy array of current player ids.
+    This is the core learn logic, factored out so it can run either
+    synchronously or in a background thread (async mode).
     """
-    next_obs = torch.as_tensor(obs_np, device=self._device)
+    obs = buf["obs"] if isinstance(buf, dict) else self.obs
+    actions = buf["actions"] if isinstance(buf, dict) else self.actions
+    logprobs = buf["logprobs"] if isinstance(buf, dict) else self.logprobs
+    rewards = buf["rewards"] if isinstance(buf, dict) else self.rewards
+    dones = buf["dones"] if isinstance(buf, dict) else self.dones
+    values = buf["values"] if isinstance(buf, dict) else self.values
+    legal_masks = (buf["legal_actions_mask"] if isinstance(buf, dict)
+                   else self.legal_actions_mask)
+    acting_players = (buf["acting_players"] if isinstance(buf, dict)
+                      else self._acting_players)
 
     with torch.inference_mode():
       next_value = self._network.get_value(next_obs).reshape(1, -1)
-      next_players = players_np
 
-      advantages = torch.zeros_like(self.rewards, device=self._device)
+      advantages = torch.zeros_like(rewards, device=self._device)
       lastgaelam = 0
       for t in reversed(range(self._steps_per_batch)):
         if t == self._steps_per_batch - 1:
           nextvalues = next_value
           next_acting = next_players
         else:
-          nextvalues = self.values[t + 1]
-          next_acting = self._acting_players[t + 1]
+          nextvalues = values[t + 1]
+          next_acting = acting_players[t + 1]
 
-        # Vectorized player_sign: +1 same player, -1 different (zero-sum)
         self._player_sign_np[:] = np.where(
-            self._acting_players[t] == next_acting, 1.0, -1.0)
+            acting_players[t] == next_acting, 1.0, -1.0)
         player_sign = torch.as_tensor(
             self._player_sign_np, device=self._device)
 
-        nextnonterminal = 1.0 - self.dones[t]
-        delta = (self.rewards[t]
+        nextnonterminal = 1.0 - dones[t]
+        delta = (rewards[t]
                  + self._gamma * player_sign * nextvalues * nextnonterminal
-                 - self.values[t])
+                 - values[t])
         advantages[t] = lastgaelam = (
             delta + self._gamma * self._gae_lambda
             * nextnonterminal * player_sign * lastgaelam)
-      returns = advantages + self.values
+      returns = advantages + values
 
-    # Flatten and train (same as learn())
-    b_obs = self.obs.reshape(-1, self._info_state_size)
-    b_logprobs = self.logprobs.reshape(-1)
-    b_actions = self.actions.reshape(-1)
+    b_obs = obs.reshape(-1, self._info_state_size)
+    b_logprobs = logprobs.reshape(-1)
+    b_actions = actions.reshape(-1)
     b_advantages = advantages.reshape(-1)
     b_returns = returns.reshape(-1)
-    b_values = self.values.reshape(-1)
-    b_legal_masks = self.legal_actions_mask.reshape(-1, self._num_actions)
+    b_values = values.reshape(-1)
+    b_legal_masks = legal_masks.reshape(-1, self._num_actions)
 
     self._run_ppo_epochs(b_obs, b_logprobs, b_actions, b_advantages,
                          b_returns, b_values, b_legal_masks)
-
-    self.cur_batch_idx = 0
     self.updates_done += 1
+
+  def _wait_for_learn(self):
+    """Wait for any in-progress async learn thread to complete."""
+    if self._learn_thread is not None and self._learn_thread.is_alive():
+      self._learn_thread.join()
+    self._learn_thread = None
+
+  def learn_raw(self, obs_np, players_np):
+    """learn() variant that bootstraps from raw numpy arrays.
+
+    In async mode, this launches learn in a background thread and returns
+    immediately, swapping to the alternate buffer for the next rollout.
+    """
+    next_obs = torch.as_tensor(obs_np, device=self._device)
+    next_players = players_np.copy()
+
+    if self._async_learn:
+      # Wait for any previous async learn to finish
+      self._wait_for_learn()
+
+      # Capture which buffer to learn from
+      learn_buf = self._buffers[self._write_buf]
+
+      # Launch learn in background thread
+      self._learn_thread = threading.Thread(
+          target=self._gae_and_ppo,
+          args=(learn_buf, next_obs, next_players),
+          daemon=True)
+      self._learn_thread.start()
+
+      # Swap to the other buffer for the next rollout
+      self._write_buf = 1 - self._write_buf
+      self._set_active_buffer(self._write_buf)
+      self.cur_batch_idx = 0
+    else:
+      self._gae_and_ppo(None, next_obs, next_players)
+      self.cur_batch_idx = 0
 
   def learn(self, time_steps):
     """Compute GAE, flatten buffers, and run PPO + magnetic updates.
@@ -440,66 +534,17 @@ class NashPGAgent:
     Args:
       time_steps: list of current TimeStep objects (for bootstrapping).
     """
-    # Bootstrap value from the next observation
     obs_list = []
     for ts in time_steps:
       pid = ts.observations["current_player"]
       obs_list.append(ts.observations["info_state"][pid])
     next_obs = torch.tensor(
         np.array(obs_list), dtype=torch.float32, device=self._device)
+    next_players = np.array(
+        [ts.observations["current_player"] for ts in time_steps])
 
-    with torch.inference_mode():
-      next_value = self._network.get_value(next_obs).reshape(1, -1)
-
-      # Determine the current player for the bootstrap state
-      next_players = np.array(
-          [ts.observations["current_player"] for ts in time_steps])
-
-      # GAE computation with zero-sum player correction.
-      # The shared network predicts value from the current player's
-      # perspective. When the player changes between consecutive steps,
-      # the opponent's value is the negative of the current player's
-      # value (zero-sum property), so we negate the bootstrap.
-      advantages = torch.zeros_like(self.rewards, device=self._device)
-      lastgaelam = 0
-      for t in reversed(range(self._steps_per_batch)):
-        if t == self._steps_per_batch - 1:
-          nextvalues = next_value
-          next_acting = next_players
-        else:
-          nextvalues = self.values[t + 1]
-          next_acting = self._acting_players[t + 1]
-
-        # Vectorized player_sign: +1 same player, -1 different (zero-sum)
-        self._player_sign_np[:] = np.where(
-            self._acting_players[t] == next_acting, 1.0, -1.0)
-        player_sign = torch.as_tensor(
-            self._player_sign_np, device=self._device)
-
-        nextnonterminal = 1.0 - self.dones[t]
-        delta = (self.rewards[t]
-                 + self._gamma * player_sign * nextvalues * nextnonterminal
-                 - self.values[t])
-        advantages[t] = lastgaelam = (
-            delta + self._gamma * self._gae_lambda
-            * nextnonterminal * player_sign * lastgaelam)
-      returns = advantages + self.values
-
-    # Flatten [steps_per_batch, num_envs] -> [batch_size]
-    b_obs = self.obs.reshape(-1, self._info_state_size)
-    b_logprobs = self.logprobs.reshape(-1)
-    b_actions = self.actions.reshape(-1)
-    b_advantages = advantages.reshape(-1)
-    b_returns = returns.reshape(-1)
-    b_values = self.values.reshape(-1)
-    b_legal_masks = self.legal_actions_mask.reshape(-1, self._num_actions)
-
-    self._run_ppo_epochs(b_obs, b_logprobs, b_actions, b_advantages,
-                         b_returns, b_values, b_legal_masks)
-
-    # Reset for next rollout
+    self._gae_and_ppo(None, next_obs, next_players)
     self.cur_batch_idx = 0
-    self.updates_done += 1
 
   def _run_ppo_epochs(self, b_obs, b_logprobs, b_actions, b_advantages,
                       b_returns, b_values, b_legal_masks):

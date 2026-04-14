@@ -80,6 +80,8 @@ flags.DEFINE_integer("outer_loop_every", 100,
 flags.DEFINE_string("device", "cpu", "Torch device for rollout (cpu, mps).")
 flags.DEFINE_string("learn_device", None,
                     "Torch device for learn() only (e.g. mps). None = same as device.")
+flags.DEFINE_bool("async_learn", False,
+                  "Enable async double-buffered learning (learn in background thread).")
 flags.DEFINE_integer("seed", 42, "Random seed.")
 
 # Convergence mode flags.
@@ -139,6 +141,10 @@ def run_one_benchmark(envs, agent, num_updates, num_steps, num_envs,
       agent.learn(time_steps)
     t1 = time.perf_counter()
     t_learn += t1 - t0
+
+  # Wait for any pending async learn to complete
+  if hasattr(agent, '_wait_for_learn'):
+    agent._wait_for_learn()
 
   t_total = time.perf_counter() - t_total_start
   total_steps = num_updates * num_steps * num_envs
@@ -314,6 +320,11 @@ def run_convergence_benchmark(envs, agent, game, config):
         agent.post_step(rewards, dones)
       agent.learn(time_steps)
 
+    # Wait for async learn before magnetic update or eval
+    if hasattr(agent, '_wait_for_learn') and (
+        update % FLAGS.outer_loop_every == 0 or update % eval_every == 0):
+      agent._wait_for_learn()
+
     # Outer loop: update magnetic reference
     if update % FLAGS.outer_loop_every == 0:
       agent.update_magnetic_reference()
@@ -437,6 +448,7 @@ def _create_envs_and_agent():
       magnetic_cost=FLAGS.magnetic_cost,
       device=FLAGS.device,
       learn_device=FLAGS.learn_device,
+      async_learn=FLAGS.async_learn,
   )
 
   return envs, agent, game
@@ -461,6 +473,7 @@ def _build_config():
       "seed": FLAGS.seed,
       "device": FLAGS.device,
       "learn_device": FLAGS.learn_device,
+      "async_learn": FLAGS.async_learn,
   }
 
 
