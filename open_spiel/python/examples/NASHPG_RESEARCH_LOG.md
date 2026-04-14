@@ -13,10 +13,14 @@ Previous 128x128 results archived in `NASHPG_RESEARCH_LOG_128x128_ARCHIVED.md`.
 | Original (SyncVectorEnv, no raw) | **7,124** | env 36.5%, learn 34.5%, agent 23.9%, other 4.6% |
 | Raw + 6 workers (no JIT/GAE opts) | **14,196** | learn 57.7%, env 21.8%, agent 20.1% |
 | Raw + 6 workers + JIT + GAE opts | **13,850** | learn 57.6%, env 21.5%, agent 20.5% |
+| MPS learn-only (sync) | **16,840** | learn 49.3%, env 25.9%, agent 24.5% |
+| Async learn (CPU) | **18,881** | learn 11.9%, env 37.6%, agent 41.5% |
+| **Async + MPS learn** | **24,625** | **learn 9.6%, env 39.9%, agent 40.9%** |
 
-**Key observation**: With 512x512, **learn() dominates at 58%** of time (vs 44% with 128x128).
-The JIT trace and vectorized GAE optimizations from 128x128 are negligible here. Optimizations
-targeting learn() (PPO forward+backward passes) will have the highest impact.
+**Key observations**:
+- With 512x512, learn() was 58% on CPU but is now only ~10% with async+MPS.
+- The bottleneck shifted from learn→compute to env.step()+agent.step() I/O.
+- Next gains require C++ batched env or reducing inference overhead.
 
 ## Tested Ideas
 
@@ -102,10 +106,12 @@ Priority is reordered for 512x512 where learn() is the dominant bottleneck (58% 
 - **Description**: Actor and critic are separate 517→512→512 MLPs. Fuse first layer(s) into shared trunk: 517→512 shared, then split to 512→512→151 (actor) and 512→512→1 (critic). Saves one 517×512 matmul per forward pass (significant at this size).
 - **Risk**: May affect training dynamics. Shared trunk changes optimization landscape.
 
-### E. C++ Batched Environment Step (EnvPool-style)
-- **Expected impact**: MEDIUM for 512x512 (env is only 22% of time now)
+### E. C++ Batched Environment Step
+- **Expected impact**: HIGH now that env.step is ~34% of async+MPS time
 - **Effort**: VERY HIGH (2-5 days)
-- **Description**: Step N game states in C++ with pybind11, returning numpy arrays directly.
+- **Description**: Write a `BatchStepper` C++ class that holds N `State` objects and exposes a single `step(actions_array) -> (obs_array, legal_array, rewards_array, dones_array)` method. This eliminates ~384 Python→C++ round-trips per batch (64 envs × 6 calls each) down to 1. Chance node sampling moves to C++ RNG. The key bottleneck is the *number* of Python↔C++ boundary crossings, not pybind11 overhead per call.
+- **Architecture**: Add to `open_spiel/python/pybind11/`. Hold N `State*` in a vector, iterate in C++, write directly into numpy buffers via `py::array_t`. Model on `pyspiel.cc` lines 341-425.
+- **Expected speedup**: 5-10x on env stepping (34% of total) → ~15-30% overall.
 - **References**: EnvPool (https://github.com/sail-sg/envpool)
 
 ### F. Batch Size Scaling -- RETEST NEEDED
