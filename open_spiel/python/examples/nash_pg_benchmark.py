@@ -50,6 +50,7 @@ import torch
 
 from open_spiel.python import rl_environment
 from open_spiel.python.pytorch import nash_pg
+from open_spiel.python.vector_env import BatchStepperEnv
 from open_spiel.python.vector_env import SubprocVectorEnv
 from open_spiel.python.vector_env import SyncVectorEnv
 
@@ -110,6 +111,8 @@ flags.DEFINE_bool("lr_decay", False,
                   "Linear LR decay from initial to 10% over total updates.")
 flags.DEFINE_bool("layer_norm", False,
                   "Use LayerNorm in actor and critic networks.")
+flags.DEFINE_bool("batch_stepper", False,
+                  "Use C++ BatchStepper (no subprocesses, single call stepping).")
 
 
 def run_one_benchmark(envs, agent, num_updates, num_steps, num_envs,
@@ -438,10 +441,17 @@ def run_convergence_benchmark(envs, agent, game, config):
 
 def _create_envs_and_agent():
   """Create environments and agent from flags. Returns (envs, agent, game)."""
-  if FLAGS.num_workers > 6:
-    logging.warning("Capping num_workers to 6 (max allowed).")
-    FLAGS.num_workers = 6
-  if FLAGS.num_workers > 1:
+  if FLAGS.batch_stepper:
+    envs = BatchStepperEnv(
+        num_envs=FLAGS.num_envs,
+        game_name=FLAGS.game,
+        game_params={"enriched_obs": True},
+        seed=FLAGS.seed,
+    )
+  elif FLAGS.num_workers > 1:
+    if FLAGS.num_workers > 6:
+      logging.warning("Capping num_workers to 6 (max allowed).")
+      FLAGS.num_workers = 6
     envs = SubprocVectorEnv(
         num_envs=FLAGS.num_envs,
         num_workers=FLAGS.num_workers,
@@ -506,6 +516,7 @@ def _build_config():
       "async_learn": FLAGS.async_learn,
       "defer_critic": FLAGS.defer_critic,
       "fp16_inference": FLAGS.fp16_inference,
+      "batch_stepper": FLAGS.batch_stepper,
   }
 
 
@@ -518,14 +529,25 @@ def main_throughput(envs, agent, config):
   })
   logging.info("Config: %s", json.dumps(config))
 
-  # Warmup (always use standard path)
-  time_steps = envs.reset()
-  for _ in range(FLAGS.warmup_updates):
-    for _ in range(FLAGS.num_steps):
-      agent_output = agent.step(time_steps)
-      time_steps, rewards, dones, _ = envs.step(agent_output, reset_if_done=True)
-      agent.post_step(rewards, dones)
-    agent.learn(time_steps)
+  # Warmup
+  use_raw = FLAGS.use_raw
+  if use_raw:
+    obs, mask, players = envs.reset_raw()
+    for _ in range(FLAGS.warmup_updates):
+      for _ in range(FLAGS.num_steps):
+        actions = agent.step_raw(obs, mask, players)
+        obs, mask, players, rewards, dones = envs.step_raw(
+            actions, reset_if_done=True)
+        agent.post_step_raw(rewards, dones, players)
+      agent.learn_raw(obs, players)
+  else:
+    time_steps = envs.reset()
+    for _ in range(FLAGS.warmup_updates):
+      for _ in range(FLAGS.num_steps):
+        agent_output = agent.step(time_steps)
+        time_steps, rewards, dones, _ = envs.step(agent_output, reset_if_done=True)
+        agent.post_step(rewards, dones)
+      agent.learn(time_steps)
   logging.info("Warmup complete (%d updates).", FLAGS.warmup_updates)
 
   # Run multiple passes and average
@@ -619,6 +641,8 @@ def main_convergence(envs, agent, game, config):
 
 
 def main(unused_argv):
+  if FLAGS.batch_stepper:
+    FLAGS.use_raw = True  # BatchStepper only supports raw interface
   if FLAGS.num_threads > 0:
     torch.set_num_threads(FLAGS.num_threads)
   envs, agent, game = _create_envs_and_agent()

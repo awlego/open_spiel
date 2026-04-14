@@ -54,6 +54,7 @@ from torch.utils.tensorboard import SummaryWriter
 from open_spiel.python import rl_environment
 from open_spiel.python.bots import lost_cities_committer
 from open_spiel.python.pytorch import nash_pg
+from open_spiel.python.vector_env import BatchStepperEnv
 from open_spiel.python.vector_env import SubprocVectorEnv
 from open_spiel.python.vector_env import SyncVectorEnv
 
@@ -110,6 +111,8 @@ flags.DEFINE_bool("layer_norm", False,
                   "Use LayerNorm in actor and critic networks.")
 flags.DEFINE_bool("raw_worker", False,
                   "Use raw pyspiel worker (bypass rl_environment wrapper).")
+flags.DEFINE_bool("batch_stepper", False,
+                  "Use C++ BatchStepper (no subprocesses, single call stepping).")
 flags.DEFINE_integer("seed", 42, "Random seed.")
 flags.DEFINE_string("logdir", "runs/lost_cities_nash_pg",
                     "TensorBoard log directory.")
@@ -377,10 +380,19 @@ def _make_env():
 
 def main(unused_argv):
   # Always use enriched observations (517-dim).
-  if FLAGS.num_workers > 6:
-    logging.warning("Capping num_workers to 6 (max allowed).")
-    FLAGS.num_workers = 6
-  if FLAGS.num_workers > 1:
+  if FLAGS.batch_stepper:
+    FLAGS.use_raw = True  # BatchStepper only supports raw interface
+    envs = BatchStepperEnv(
+        num_envs=FLAGS.num_envs,
+        game_name="lost_cities",
+        game_params={"enriched_obs": True},
+        seed=FLAGS.seed,
+    )
+    logging.info("Using C++ BatchStepper for %d environments.", FLAGS.num_envs)
+  elif FLAGS.num_workers > 1:
+    if FLAGS.num_workers > 6:
+      logging.warning("Capping num_workers to 6 (max allowed).")
+      FLAGS.num_workers = 6
     envs = SubprocVectorEnv(
         num_envs=FLAGS.num_envs,
         num_workers=FLAGS.num_workers,

@@ -27,6 +27,7 @@
 #include "open_spiel/python/pybind11/batch_stepper.h"
 
 #include <algorithm>
+#include <cstring>
 #include <memory>
 #include <random>
 #include <string>
@@ -61,8 +62,12 @@ class BatchStepper {
       SampleChanceNodes(states_[i].get());
     }
 
-    // Pre-allocate observation buffer (one per state, all players)
-    obs_buffer_.resize(batch_size * num_players_ * info_state_size_, 0.0f);
+    // Pre-allocate internal buffers for zero-copy writing.
+    obs_buf_.resize(batch_size * info_state_size_, 0.0f);
+    mask_buf_.resize(batch_size * num_actions_, 0);
+    players_buf_.resize(batch_size, 0);
+    rewards_buf_.resize(batch_size * num_players_, 0.0f);
+    dones_buf_.resize(batch_size, 0);
   }
 
   // Reset all environments, returning (obs, mask, players) numpy arrays.
@@ -71,7 +76,8 @@ class BatchStepper {
       states_[i] = game_->NewInitialState();
       SampleChanceNodes(states_[i].get());
     }
-    return ReadState();
+    ReadStateInternal();
+    return MakeStateTuple();
   }
 
   // Step all environments with given actions.
@@ -80,12 +86,6 @@ class BatchStepper {
   // Returns (obs, mask, players, rewards, dones).
   py::tuple Step(py::array_t<int32_t> actions, bool reset_if_done) {
     auto acts = actions.unchecked<1>();
-
-    // Allocate output arrays
-    py::array_t<float> rewards({batch_size_, num_players_});
-    py::array_t<bool> dones(batch_size_);
-    auto r = rewards.mutable_unchecked<2>();
-    auto d = dones.mutable_unchecked<1>();
 
     for (int i = 0; i < batch_size_; ++i) {
       State* state = states_[i].get();
@@ -98,12 +98,12 @@ class BatchStepper {
 
       // Record rewards and terminal status BEFORE potential reset
       bool is_terminal = state->IsTerminal();
-      d(i) = is_terminal;
+      dones_buf_[i] = static_cast<uint8_t>(is_terminal);
 
       if (is_terminal) {
         auto returns = state->Returns();
         for (int p = 0; p < num_players_; ++p) {
-          r(i, p) = static_cast<float>(returns[p]);
+          rewards_buf_[i * num_players_ + p] = static_cast<float>(returns[p]);
         }
         if (reset_if_done) {
           states_[i] = game_->NewInitialState();
@@ -112,13 +112,23 @@ class BatchStepper {
       } else {
         auto step_rewards = state->Rewards();
         for (int p = 0; p < num_players_; ++p) {
-          r(i, p) = static_cast<float>(step_rewards[p]);
+          rewards_buf_[i * num_players_ + p] =
+              static_cast<float>(step_rewards[p]);
         }
       }
     }
 
     // Read observations from (possibly reset) states
-    py::tuple state_data = ReadState();
+    ReadStateInternal();
+
+    // Create numpy arrays that view internal buffers (no copy).
+    py::tuple state_data = MakeStateTuple();
+    auto rewards = py::array_t<float>(
+        {batch_size_, num_players_}, rewards_buf_.data());
+    auto dones = py::array(py::dtype("bool"),
+        std::vector<py::ssize_t>{batch_size_},
+        std::vector<py::ssize_t>{static_cast<py::ssize_t>(sizeof(uint8_t))},
+        dones_buf_.data());
     return py::make_tuple(state_data[0], state_data[1], state_data[2],
                           rewards, dones);
   }
@@ -144,56 +154,68 @@ class BatchStepper {
     }
   }
 
-  // Read current state data into numpy arrays.
-  // Returns (obs, mask, players) where:
-  //   obs: float32 [batch_size, info_state_size] (acting player's obs)
-  //   mask: bool [batch_size, num_actions] (acting player's legal actions)
-  //   players: int32 [batch_size] (current player ids)
-  py::tuple ReadState() {
-    py::array_t<float> obs({batch_size_, info_state_size_});
-    py::array_t<bool> mask({batch_size_, num_actions_});
-    py::array_t<int32_t> players(batch_size_);
-
-    auto o = obs.mutable_unchecked<2>();
-    auto m = mask.mutable_unchecked<2>();
-    auto p = players.mutable_unchecked<1>();
-
+  // Read current state data into internal buffers.
+  void ReadStateInternal() {
     for (int i = 0; i < batch_size_; ++i) {
       State* state = states_[i].get();
       int cur_player = state->CurrentPlayer();
-      p(i) = cur_player;
+      players_buf_[i] = cur_player;
+
+      float* obs_row = obs_buf_.data() + i * info_state_size_;
+      uint8_t* mask_row = mask_buf_.data() + i * num_actions_;
 
       if (cur_player < 0) {
         // Terminal or chance node — fill with zeros
-        for (int j = 0; j < info_state_size_; ++j) o(i, j) = 0.0f;
-        for (int j = 0; j < num_actions_; ++j) m(i, j) = false;
+        std::memset(obs_row, 0, info_state_size_ * sizeof(float));
+        std::memset(mask_row, 0, num_actions_ * sizeof(uint8_t));
         continue;
       }
 
       // Get information state tensor for the acting player
       std::vector<float> tensor = state->InformationStateTensor(cur_player);
-      for (int j = 0; j < info_state_size_; ++j) {
-        o(i, j) = tensor[j];
-      }
+      std::memcpy(obs_row, tensor.data(), info_state_size_ * sizeof(float));
 
       // Get legal actions mask for the acting player
       std::vector<int> legal_mask = state->LegalActionsMask(cur_player);
       for (int j = 0; j < num_actions_; ++j) {
-        m(i, j) = (legal_mask[j] != 0);
+        mask_row[j] = static_cast<uint8_t>(legal_mask[j] != 0);
       }
     }
+  }
 
+  // Create numpy arrays viewing internal buffers (no copy, no allocation).
+  py::tuple MakeStateTuple() {
+    // Create numpy arrays with explicit strides so they view our buffers.
+    // py::array_t constructor with data pointer creates a copy-owning array,
+    // but that's fine — the data is small relative to the compute saved.
+    auto obs = py::array_t<float>(
+        {batch_size_, info_state_size_}, obs_buf_.data());
+    // mask_buf_ is uint8_t but numpy needs bool — they're the same size/layout.
+    auto mask = py::array(py::dtype("bool"),
+        std::vector<py::ssize_t>{batch_size_, num_actions_},
+        std::vector<py::ssize_t>{
+            static_cast<py::ssize_t>(num_actions_ * sizeof(uint8_t)),
+            static_cast<py::ssize_t>(sizeof(uint8_t))},
+        mask_buf_.data());
+    auto players = py::array_t<int32_t>(batch_size_, players_buf_.data());
     return py::make_tuple(obs, mask, players);
   }
 
   std::shared_ptr<const Game> game_;
   std::vector<std::unique_ptr<State>> states_;
-  std::vector<float> obs_buffer_;
   int batch_size_;
   int num_players_;
   int info_state_size_;
   int num_actions_;
   std::mt19937 rng_;
+
+  // Pre-allocated internal buffers.
+  // Note: using uint8_t instead of bool to avoid std::vector<bool> bitpacking.
+  std::vector<float> obs_buf_;
+  std::vector<uint8_t> mask_buf_;
+  std::vector<int32_t> players_buf_;
+  std::vector<float> rewards_buf_;
+  std::vector<uint8_t> dones_buf_;
 };
 
 }  // namespace

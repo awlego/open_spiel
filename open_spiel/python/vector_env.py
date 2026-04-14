@@ -645,6 +645,52 @@ class SubprocVectorEnv(object):
     self._processes = []
 
 
+class BatchStepperEnv(object):
+  """Vectorized environment using C++ BatchStepper (no subprocesses).
+
+  Replaces SubprocVectorEnv by stepping all game states in a single C++ call,
+  eliminating subprocess overhead, shared memory, and barrier synchronization.
+  Only supports the raw (numpy) interface (reset_raw/step_raw).
+  """
+
+  def __init__(self, num_envs, game_name, game_params=None, seed=42):
+    import pyspiel as _pyspiel
+
+    self._num_envs = num_envs
+    self._stepper = _pyspiel.BatchStepper(
+        game_name, num_envs, game_params or {}, seed)
+    self._num_players = self._stepper.num_players
+    self._info_state_size = self._stepper.info_state_size
+    self._num_actions = self._stepper.num_actions
+    self._game = _pyspiel.load_game(game_name, game_params or {})
+
+    # Expose .envs[0]._game for compatibility with training scripts.
+    self.envs = [type("_EnvProxy", (), {"_game": self._game})]
+
+  def __len__(self):
+    return self._num_envs
+
+  def observation_spec(self):
+    return {"info_state": [self._info_state_size]}
+
+  @property
+  def num_players(self):
+    return self._num_players
+
+  def reset_raw(self):
+    obs, mask, players = self._stepper.reset()
+    return obs, mask, players
+
+  def step_raw(self, actions, reset_if_done=False):
+    actions = np.asarray(actions, dtype=np.int32)
+    obs, mask, players, rewards, dones = self._stepper.step(
+        actions, reset_if_done)
+    return obs, mask, players, rewards, dones
+
+  def close(self):
+    pass
+
+
 class SyncVectorEnv(object):
   """A vectorized RL Environment.
 
