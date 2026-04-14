@@ -160,7 +160,9 @@ class NashPGAgent:
                device="cpu",
                learn_device=None,
                async_learn=False,
-               defer_critic=False):
+               defer_critic=False,
+               fp16_inference=False,
+               compile_inference=False):
     """Initialize the NashPG agent.
 
     Args:
@@ -208,6 +210,8 @@ class NashPGAgent:
     self._device = torch.device(device)
     self._learn_device = torch.device(learn_device) if learn_device else None
     self._defer_critic = defer_critic
+    self._fp16_inference = fp16_inference
+    self._compile_inference = compile_inference
 
     self._batch_size = num_envs * steps_per_batch
     self._minibatch_size = max(1, self._batch_size // num_minibatches)
@@ -282,6 +286,8 @@ class NashPGAgent:
       if self._learn_device is not None:
         self._inference_network = copy.deepcopy(self._network).to(self._device)
         self._inference_network.eval()
+        if compile_inference:
+          self._inference_network = torch.compile(self._inference_network)
       else:
         self._inference_network = None
 
@@ -390,7 +396,14 @@ class NashPGAgent:
     # Use inference network if available (async + learn_device mode)
     net = self._inference_network or self._network
     with torch.inference_mode():
-      if self._defer_critic:
+      if self._fp16_inference:
+        with torch.autocast(device_type="cpu", dtype=torch.float16):
+          if self._defer_critic:
+            action, logprob = net.get_action_no_critic(obs, mask)
+          else:
+            action, logprob, value, _ = net.get_action_and_value_fast(obs, mask)
+            self.values[self.cur_batch_idx] = value.float().flatten()
+      elif self._defer_critic:
         action, logprob = net.get_action_no_critic(obs, mask)
       else:
         action, logprob, value, _ = net.get_action_and_value_fast(obs, mask)

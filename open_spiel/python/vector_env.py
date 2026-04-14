@@ -91,6 +91,76 @@ def _shm_worker_loop(worker_id, env_start, env_count, env_constructor,
     done_barrier.wait()
 
 
+def _shm_worker_loop_spinwait(worker_id, env_start, env_count, env_constructor,
+                              shm_obs, shm_legal, shm_rewards,
+                              shm_current_player, shm_dones, shm_step_type,
+                              shm_actions, shm_reset_flags,
+                              obs_shape, legal_shape, num_players,
+                              shm_cmd, shm_status):
+  """Spin-wait worker: lower latency synchronization using shared flags."""
+  envs = [env_constructor() for _ in range(env_count)]
+
+  info_state_size = obs_shape[1]
+  num_actions = legal_shape[1]
+  obs_np = np.frombuffer(shm_obs, dtype=np.float32).reshape(
+      obs_shape[0] // num_players, num_players, info_state_size)
+  legal_np = np.frombuffer(shm_legal, dtype=np.int32).reshape(
+      legal_shape[0] // num_players, num_players, num_actions)
+  rewards_np = np.frombuffer(shm_rewards, dtype=np.float64).reshape(
+      -1, num_players)
+  cur_player_np = np.frombuffer(shm_current_player, dtype=np.int32)
+  dones_np = np.frombuffer(shm_dones, dtype=np.int32)
+  step_type_np = np.frombuffer(shm_step_type, dtype=np.int32)
+  actions_np = np.frombuffer(shm_actions, dtype=np.int32)
+  reset_flags_np = np.frombuffer(shm_reset_flags, dtype=np.int32)
+  cmd_np = np.frombuffer(shm_cmd, dtype=np.int32)
+  status_np = np.frombuffer(shm_status, dtype=np.int32)
+
+  while True:
+    # Spin-wait for command (cmd_np[0] changes from 0 to command code).
+    while cmd_np[0] == 0:
+      pass
+    cmd = cmd_np[0]
+
+    if cmd == 99:  # close
+      status_np[worker_id] = 99
+      break
+
+    if cmd == 1:  # step_and_reset
+      for j in range(env_count):
+        gi = env_start + j
+        action = int(actions_np[gi])
+        ts = envs[j].step([action])
+        is_done = ts.last()
+        dones_np[gi] = int(is_done)
+        if ts.rewards is not None:
+          for p in range(num_players):
+            rewards_np[gi, p] = ts.rewards[p]
+        if is_done and reset_flags_np[0]:
+          ts = envs[j].reset()
+        _write_timestep(ts, gi, obs_np, legal_np, cur_player_np,
+                        step_type_np, num_players, info_state_size, num_actions)
+
+    elif cmd == 2:  # reset
+      for j in range(env_count):
+        gi = env_start + j
+        if reset_flags_np[gi]:
+          ts = envs[j].reset()
+        else:
+          ts = envs[j].get_time_step()
+        _write_timestep(ts, gi, obs_np, legal_np, cur_player_np,
+                        step_type_np, num_players, info_state_size, num_actions)
+        dones_np[gi] = 0
+        rewards_np[gi, :] = 0.0
+
+    # Signal done.
+    status_np[worker_id] = 1
+    # Wait for main to acknowledge (reset cmd to 0).
+    while cmd_np[0] != 0:
+      pass
+    status_np[worker_id] = 0
+
+
 def _write_timestep(ts, gi, obs_np, legal_np, cur_player_np,
                     step_type_np, num_players, info_state_size, num_actions):
   """Write a TimeStep's data into the shared arrays at global index gi."""
@@ -120,13 +190,15 @@ class SubprocVectorEnv(object):
     )
   """
 
-  def __init__(self, num_envs, num_workers, env_constructor):
+  def __init__(self, num_envs, num_workers, env_constructor,
+               use_spinwait=False):
     if num_workers > num_envs:
       num_workers = num_envs
 
     self._num_envs = num_envs
     self._num_workers = num_workers
     self._closed = False
+    self._use_spinwait = use_spinwait
 
     # Get specs from a temporary env.
     tmp_env = env_constructor()
@@ -170,39 +242,67 @@ class SubprocVectorEnv(object):
     self._actions_np = np.frombuffer(self._shm_actions, dtype=np.int32)
     self._reset_flags_np = np.frombuffer(self._shm_reset_flags, dtype=np.int32)
 
-    # Synchronization: one Event per worker (main→worker), one Barrier (all).
     # Use fork context to avoid spawn serialization issues on macOS.
     ctx = mp.get_context("fork")
-    self._done_barrier = ctx.Barrier(num_workers + 1)
-    self._cmd_events = []
-    self._cmd_arrays = []
     self._processes = []
 
     # Divide envs across workers.
     base, extra = divmod(num_envs, num_workers)
     offset = 0
-    for i in range(num_workers):
-      chunk = base + (1 if i < extra else 0)
-      evt = ctx.Event()
-      cmd = ctx.Value(ctypes.c_int, 0)
-      p = ctx.Process(
-          target=_shm_worker_loop,
-          args=(i, offset, chunk, env_constructor,
-                self._shm_obs, self._shm_legal, self._shm_rewards,
-                self._shm_current_player, self._shm_dones,
-                self._shm_step_type, self._shm_actions,
-                self._shm_reset_flags,
-                (num_envs * np_, iss),
-                (num_envs * np_, na),
-                np_,
-                evt, self._done_barrier, cmd),
-          daemon=True,
-      )
-      p.start()
-      self._cmd_events.append(evt)
-      self._cmd_arrays.append(cmd)
-      self._processes.append(p)
-      offset += chunk
+
+    if use_spinwait:
+      # Spin-wait mode: shared flags instead of Events/Barriers.
+      # cmd[0]: command from main (0=idle, 1=step, 2=reset, 99=close)
+      # status[i]: worker i status (0=idle, 1=done, 99=closed)
+      self._shm_cmd = mp.RawArray(ctypes.c_int, 1)
+      self._shm_status = mp.RawArray(ctypes.c_int, num_workers)
+      self._status_np = np.frombuffer(self._shm_status, dtype=np.int32)
+      self._cmd_np = np.frombuffer(self._shm_cmd, dtype=np.int32)
+      for i in range(num_workers):
+        chunk = base + (1 if i < extra else 0)
+        p = ctx.Process(
+            target=_shm_worker_loop_spinwait,
+            args=(i, offset, chunk, env_constructor,
+                  self._shm_obs, self._shm_legal, self._shm_rewards,
+                  self._shm_current_player, self._shm_dones,
+                  self._shm_step_type, self._shm_actions,
+                  self._shm_reset_flags,
+                  (num_envs * np_, iss),
+                  (num_envs * np_, na),
+                  np_,
+                  self._shm_cmd, self._shm_status),
+            daemon=True,
+        )
+        p.start()
+        self._processes.append(p)
+        offset += chunk
+    else:
+      # Event/Barrier mode (default).
+      self._done_barrier = ctx.Barrier(num_workers + 1)
+      self._cmd_events = []
+      self._cmd_arrays = []
+      for i in range(num_workers):
+        chunk = base + (1 if i < extra else 0)
+        evt = ctx.Event()
+        cmd = ctx.Value(ctypes.c_int, 0)
+        p = ctx.Process(
+            target=_shm_worker_loop,
+            args=(i, offset, chunk, env_constructor,
+                  self._shm_obs, self._shm_legal, self._shm_rewards,
+                  self._shm_current_player, self._shm_dones,
+                  self._shm_step_type, self._shm_actions,
+                  self._shm_reset_flags,
+                  (num_envs * np_, iss),
+                  (num_envs * np_, na),
+                  np_,
+                  evt, self._done_barrier, cmd),
+            daemon=True,
+        )
+        p.start()
+        self._cmd_events.append(evt)
+        self._cmd_arrays.append(cmd)
+        self._processes.append(p)
+        offset += chunk
 
     # Expose .envs[0]._game for compatibility with training scripts.
     self.envs = [type("_EnvProxy", (), {"_game": self._game})]
@@ -222,10 +322,27 @@ class SubprocVectorEnv(object):
 
   def _signal_workers(self, cmd):
     """Signal all workers to execute a command, then wait for completion."""
-    for i in range(self._num_workers):
-      self._cmd_arrays[i].value = cmd
-      self._cmd_events[i].set()
-    self._done_barrier.wait()
+    if self._use_spinwait:
+      # Spin-wait: set command flag, wait for all workers to set done.
+      # Map external cmd codes: 0=step→1, 1=reset→2, 2=close→99
+      spin_cmd = {0: 1, 1: 2, 2: 99}[cmd]
+      self._cmd_np[0] = spin_cmd
+      # Spin until all workers report done.
+      nw = self._num_workers
+      while True:
+        if all(self._status_np[i] != 0 for i in range(nw)):
+          break
+      # Reset for next round.
+      self._cmd_np[0] = 0
+      # Wait for workers to acknowledge reset.
+      while True:
+        if all(self._status_np[i] == 0 for i in range(nw)):
+          break
+    else:
+      for i in range(self._num_workers):
+        self._cmd_arrays[i].value = cmd
+        self._cmd_events[i].set()
+      self._done_barrier.wait()
 
   def _init_raw_buffers(self):
     """Allocate output buffers for the raw step path."""
@@ -381,7 +498,7 @@ class SubprocVectorEnv(object):
     self._closed = True
     try:
       self._signal_workers(2)
-    except BrokenBarrierError:
+    except (BrokenBarrierError, Exception):
       pass
     for p in self._processes:
       p.join(timeout=5)

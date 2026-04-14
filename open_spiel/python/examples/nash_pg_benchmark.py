@@ -46,6 +46,7 @@ from absl import flags
 from absl import logging
 
 import numpy as np
+import torch
 
 from open_spiel.python import rl_environment
 from open_spiel.python.pytorch import nash_pg
@@ -84,6 +85,14 @@ flags.DEFINE_bool("async_learn", False,
                   "Enable async double-buffered learning (learn in background thread).")
 flags.DEFINE_bool("defer_critic", False,
                   "Defer critic computation to learn phase (skip during rollout).")
+flags.DEFINE_bool("fp16_inference", False,
+                  "Use float16 for inference (CPU autocast).")
+flags.DEFINE_bool("compile_inference", False,
+                  "Use torch.compile on inference network.")
+flags.DEFINE_bool("spinwait", False,
+                  "Use spin-wait synchronization (lower latency, uses more CPU).")
+flags.DEFINE_integer("num_threads", 0,
+                     "PyTorch CPU threads (0=default). Try 1 for small batches.")
 flags.DEFINE_integer("seed", 42, "Random seed.")
 
 # Convergence mode flags.
@@ -426,6 +435,7 @@ def _create_envs_and_agent():
         num_envs=FLAGS.num_envs,
         num_workers=FLAGS.num_workers,
         env_constructor=_make_env,
+        use_spinwait=FLAGS.spinwait,
     )
   else:
     envs = SyncVectorEnv([_make_env() for _ in range(FLAGS.num_envs)])
@@ -452,6 +462,8 @@ def _create_envs_and_agent():
       learn_device=FLAGS.learn_device,
       async_learn=FLAGS.async_learn,
       defer_critic=FLAGS.defer_critic,
+      fp16_inference=FLAGS.fp16_inference,
+      compile_inference=FLAGS.compile_inference,
   )
 
   return envs, agent, game
@@ -478,6 +490,7 @@ def _build_config():
       "learn_device": FLAGS.learn_device,
       "async_learn": FLAGS.async_learn,
       "defer_critic": FLAGS.defer_critic,
+      "fp16_inference": FLAGS.fp16_inference,
   }
 
 
@@ -591,6 +604,8 @@ def main_convergence(envs, agent, game, config):
 
 
 def main(unused_argv):
+  if FLAGS.num_threads > 0:
+    torch.set_num_threads(FLAGS.num_threads)
   envs, agent, game = _create_envs_and_agent()
   config = _build_config()
 

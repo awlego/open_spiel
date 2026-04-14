@@ -76,81 +76,140 @@ Previous 128x128 results archived in `NASHPG_RESEARCH_LOG_128x128_ARCHIVED.md`.
 - **Notes**: Rollout stays on CPU, only PPO epochs run on MPS GPU. learn() went from 3.33s to 2.39s (-28%). Unified memory makes the CPU↔MPS data transfer nearly free. New best config.
 - **Implementation**: Added `learn_device` parameter to NashPGAgent and `--learn_device` flag to benchmark. Also refactored learn()/learn_raw() to share a single `_run_ppo_epochs()` method.
 
+### 10. Longer Rollouts (num_steps scaling)
+- **Status**: DONE - THROUGHPUT WIN but NO CONVERGENCE WIN
+- **Throughput results** (all with async+MPS, 64 envs):
+  - 128 steps: 24,313 steps/s (baseline)
+  - 256 steps: 33,683 steps/s (+38.5%)
+  - 512 steps: 35,508 steps/s (+46.0%)
+  - 1024 steps: 36,155 steps/s (+48.7%)
+- **Convergence results**: 256 steps with 4 epochs is WORSE than baseline at every wall-clock time. 256 steps with 8 epochs (compensating for 2x batch) is also worse. The reduced gradient update frequency (2x fewer updates per step) hurts convergence more than the throughput gain helps.
+- **Key insight**: Only improvements that speed up the per-step loop (agent.step() + env.step()) without changing batch structure actually improve wall-clock convergence.
+
+### 11. Batch Size Scaling (num_envs + num_steps)
+- **Status**: DONE - THROUGHPUT ONLY, NO CONVERGENCE BENEFIT
+- **Results** (all with async+MPS, 256 steps):
+  - 64 envs: 33,683 steps/s
+  - 128 envs: 39,464 steps/s
+  - 256 envs: 45,524 steps/s
+  - 512 envs: 52,163 steps/s
+  - 1024 envs: 55,680 steps/s
+- **Notes**: Raw throughput scales well, but all configs change the gradient-to-sample ratio, making wall-clock convergence worse than baseline. Useful for throughput benchmarking but not for actual training.
+
+### 12. fp16 Inference (CPU autocast)
+- **Status**: DONE - SIGNIFICANTLY WORSE
+- **Result**: 24,313 → 17,512 steps/s (-28%)
+- **Notes**: CPU autocast overhead for float32→float16→float32 conversions dominates at batch-64. Not viable on CPU.
+
+### 13. torch.compile on Inference Network
+- **Status**: DONE - NO EFFECT
+- **Result**: Micro-benchmark shows identical speed (0.589ms vs 0.570ms). Not worth the compile overhead.
+- **Notes**: torch.compile doesn't help for small-batch CPU inference (batch-64, 512-wide MLP). Kernel fusion opportunities are minimal.
+
+### 14. ONNX Runtime for CPU Inference
+- **Status**: DONE - 2.6x SLOWER
+- **Result**: ONNX CPUExecutionProvider: 1.559ms vs PyTorch 0.598ms
+- **Notes**: ONNX Runtime's ARM CPU backend is much slower than PyTorch's on M1 Max. CoreML provider has initialization issues. Not viable.
+
+### 15. MLX (Apple Silicon Native) for Inference
+- **Status**: DONE - NO IMPROVEMENT
+- **Result**: MLX full pipeline: 0.546ms vs PyTorch 1-thread: 0.525ms
+- **Notes**: MLX is roughly equivalent to PyTorch with 1 thread. The numpy↔MLX conversion overhead negates any compute advantage. Not worth the complexity of maintaining dual ML frameworks.
+
+### 16. Numpy Categorical Sampling (replace torch.multinomial)
+- **Status**: DONE - SLOWER IN PIPELINE
+- **Result**: Micro-benchmark: numpy cumsum 40% faster than torch.multinomial. Full pipeline: 20,389 vs 24,313 steps/s (-16%).
+- **Notes**: The torch→numpy→torch boundary crossing in the full pipeline adds more overhead than the sampling saves. torch.multinomial is optimal in context.
+
+### 17. Spin-Wait Synchronization (SubprocVectorEnv)
+- **Status**: DONE - BROKEN ON ARM
+- **Result**: Micro-benchmark shows 118x faster sync (0.002ms vs 0.237ms). Full benchmark hangs.
+- **Notes**: ARM weak memory model means writes to RawArray shared memory aren't visible across processes without memory barriers. Spin-wait on RawArray flags doesn't work on M1 Mac. Would need proper atomics or memory fences. Implementation exists but is disabled.
+- **Profiling**: Barrier sync is 0.237ms/step = 27% of env.step() time, a significant overhead target for future optimization.
+
+### 18. torch.set_num_threads(1)
+- **Status**: DONE - MARGINAL IMPROVEMENT (+2.2%)
+- **Result**: 24,313 → 24,855 steps/s (+2.2%)
+- **Notes**: Single-thread inference is 17% faster in micro-benchmark (0.678ms vs 0.823ms). But learn thread also runs single-threaded, adding 9% to learn time. Net effect is marginal. Not worth the complexity of thread count management.
+
+## Profiling Results (2026-04-13)
+
+### Per-step breakdown (agent.step_raw)
+| Component | Time | % of step |
+|-----------|------|-----------|
+| Forward pass (actor+critic) | 0.455ms | 48% |
+| Sampling (softmax+multinomial+log) | 0.241ms | 25% |
+| Buffer writes | 0.047ms | 5% |
+| Tensor conversion (as_tensor) | 0.002ms | 0.2% |
+| numpy conversion (cpu().numpy()) | 0.001ms | 0.1% |
+| **Total step_raw** | **0.952ms** | **100%** |
+
+### Forward pass sub-breakdown
+| Component | Time |
+|-----------|------|
+| Actor (517→512→512→151) | 0.225ms |
+| Critic (517→512→512→1) | 0.168ms |
+| Both combined | 0.455ms |
+
+### env.step() breakdown (64 envs, 6 workers)
+| Component | Time | % of env.step |
+|-----------|------|---------------|
+| Worker computation (11 envs each) | 0.584ms | 67% |
+| Barrier synchronization | 0.237ms | 27% |
+| Main process reads | 0.015ms | 2% |
+| Other overhead | ~0.04ms | 4% |
+
+### Per-env C++ overhead
+- rl_environment.step(): 0.027ms (includes Python wrapper)
+- Raw C++ state ops: 0.005ms
+- info_state_tensor ×2: 0.014ms
+- legal_actions ×2: 0.001ms
+- Python wrapper overhead: 0.022ms (4.4x over raw C++)
+
 ## Ideas To Test
 
-Priority is reordered for 512x512 where learn() is the dominant bottleneck (58% of time).
-
-### A. torch.compile (inductor backend) -- RETEST NEEDED
-- **Impact on 128x128**: 1.02x (negligible -- network too small)
-- **Expected impact on 512x512**: POTENTIALLY SIGNIFICANT -- 512-wide layers have 16x more compute, may benefit from kernel fusion
-- **Effort**: LOW (1 line + testing)
-- **Description**: `self._network = torch.compile(self._network)`. Network is now large enough that the overhead/benefit ratio may flip. learn() is 58% of time and dominated by forward+backward passes.
-- **Risk**: Low. 3-8s compile overhead at startup.
-
-### B. MPS GPU -- RETEST NEEDED
-- **Impact on 128x128**: 0.53x (SLOWER -- kernel dispatch overhead dominated)
-- **Expected impact on 512x512**: POTENTIALLY POSITIVE -- larger matmuls (517x512, 512x512) may amortize GPU dispatch cost. Worth retesting at minimum for learn() phase.
-- **Effort**: LOW (flag change)
-- **Risk**: Low. May still be slower but the calculus has changed with 16x more compute per layer.
-
-### C. Async Rollout + Learn (Double Buffering)
-- **Expected impact**: HIGH -- overlap learn() (58% of time) with rollout collection (42%)
-- **Effort**: HIGH (1-2 days)
-- **Description**: learn() and rollout are currently sequential. With double buffering: collect rollout N+1 while learning from rollout N. Since learn() is pure PyTorch (GIL-released during tensor ops) and env stepping is in subprocesses, they can truly overlap. Theoretical max: time = max(58%, 42%) = 58% of current → ~1.7x.
-- **Risk**: GIL contention during torch.as_tensor conversions. Policy staleness of 1 batch (negligible for PPO with clip_coef=0.2).
-- **References**: Sample Factory, HuggingFace async RL survey
+Priority reordered based on profiling. With async+MPS, the bottleneck is agent.step() (34%) and env.step() (33%). Only per-step improvements help wall-clock convergence — batch size scaling is a throughput illusion.
 
 ### D. Fused Actor-Critic Forward Pass (Shared Trunk)
-- **Expected impact**: MEDIUM -- reduces total matmul work in learn()
+- **Expected impact**: LOW (~8% reduction in forward pass, ~3% overall)
 - **Effort**: LOW (1-2 hours)
-- **Description**: Actor and critic are separate 517→512→512 MLPs. Fuse first layer(s) into shared trunk: 517→512 shared, then split to 512→512→151 (actor) and 512→512→1 (critic). Saves one 517×512 matmul per forward pass (significant at this size).
-- **Risk**: May affect training dynamics. Shared trunk changes optimization landscape.
+- **Description**: Share first 517→512 layer between actor and critic. Saves one 517×512 matmul per step. Profiling shows actor=0.225ms, critic=0.168ms, so savings ~0.168ms but most is framework overhead, not compute. Actual matmul savings: 0.017ms (17M MACs at ~1 TFLOP/s).
+- **Risk**: Changes optimization landscape. Need convergence validation.
+- **Why low impact**: The forward pass overhead is dominated by Python/framework costs, not raw compute. The actual FLOPS are ~72M MACs for both networks, but total time is 0.455ms suggesting ~6x overhead.
 
-### E. C++ Batched Environment Step
-- **Expected impact**: HIGH now that env.step is ~34% of async+MPS time
+### E. C++ Batched Environment Step -- TOP PRIORITY
+- **Expected impact**: HIGH (env.step is 33% of time, C++ would reduce to ~5-10%)
 - **Effort**: VERY HIGH (2-5 days)
-- **Description**: Write a `BatchStepper` C++ class that holds N `State` objects and exposes a single `step(actions_array) -> (obs_array, legal_array, rewards_array, dones_array)` method. This eliminates ~384 Python→C++ round-trips per batch (64 envs × 6 calls each) down to 1. Chance node sampling moves to C++ RNG. The key bottleneck is the *number* of Python↔C++ boundary crossings, not pybind11 overhead per call.
-- **Architecture**: Add to `open_spiel/python/pybind11/`. Hold N `State*` in a vector, iterate in C++, write directly into numpy buffers via `py::array_t`. Model on `pyspiel.cc` lines 341-425.
-- **Expected speedup**: 5-10x on env stepping (34% of total) → ~15-30% overall.
+- **Description**: Write a `BatchStepper` C++ class that holds N `State` objects and exposes a single `step(actions_array) -> (obs_array, legal_array, rewards_array, dones_array)` method. Eliminates: (1) 384 Python→C++ round-trips per batch, (2) 0.237ms/step barrier synchronization overhead, (3) Python wrapper overhead (4.4x over raw C++).
+- **Architecture**: Add to `open_spiel/python/pybind11/`. Hold N `State*` in a vector, iterate in C++, write directly into numpy buffers via `py::array_t`.
+- **Profiled speedup**: env.step per-env: 0.027ms (Python) vs 0.005ms (raw C++) + 0.014ms (obs extraction) = 0.019ms. That's 1.4x speedup per env, plus eliminating 0.237ms sync overhead per step. Net: env.step from ~0.88ms to ~0.3ms (~3x). Overall: ~+20% wall-clock.
 - **References**: EnvPool (https://github.com/sail-sg/envpool)
 
-### F. Batch Size Scaling -- RETEST NEEDED
-- **128x128 result**: 64 envs × 128 steps was optimal
-- **Expected for 512x512**: May be different since learn() now dominates. Larger batches = more efficient GPU/SIMD matmuls in learn(), and the env overhead is relatively smaller.
-- **Effort**: LOW (flag change)
+### F. Spin-Wait with Memory Barriers (retry of #17)
+- **Expected impact**: MEDIUM (~9% overall, eliminates 0.237ms/step sync)
+- **Effort**: MEDIUM (need proper atomics, e.g., via ctypes + memory fences)
+- **Description**: Retry spin-wait synchronization with proper ARM memory barriers. The bare spin-wait is 118x faster (0.002ms vs 0.237ms) but ARM's weak memory model requires explicit barriers for cross-process visibility.
+- **Risk**: Complex systems engineering. May still have edge cases.
 
 ### G. Reduce PPO Passes -- RETEST NEEDED
 - **128x128 result**: 2ep2mb gave +43% throughput but convergence regressed
-- **Expected for 512x512**: The convergence/throughput tradeoff may differ with a larger network. Larger networks may need fewer epochs to extract useful gradients, or may need more. Worth retesting convergence.
+- **Expected for 512x512**: With async+MPS, learn() is only 23% of time, so reducing epochs gives modest throughput gain. Not worth it unless convergence improves.
 - **Effort**: LOW (flag change + convergence test)
 
-### H. ONNX Runtime for Rollout Inference
-- **Expected impact**: SMALL-MEDIUM -- may help batch-64 inference with larger network
-- **Effort**: MEDIUM (4-8 hours)
-- **References**: ONNX Runtime (https://onnxruntime.ai/)
-
-### I. Mixed Precision / float16
-- **128x128**: Skipped (network too small for compute to matter)
-- **Expected for 512x512**: Slightly more relevant -- 512-wide matmuls have more compute. M1 NEON supports float16. But still likely marginal.
-- **Effort**: LOW-MEDIUM (2-4 hours)
-
-### J. LayerNorm
+### H. LayerNorm
 - **Expected impact**: UNKNOWN -- sample efficiency improvement, not throughput
 - **Effort**: LOW
-- **Description**: May allow fewer PPO epochs or larger learning rate for same convergence.
+- **Description**: May allow fewer PPO epochs or larger learning rate for same convergence, indirectly improving wall-clock time.
 
-### K. Fuse step_raw + post_step_raw
-- **Expected impact**: SMALL (1-2%)
-- **Effort**: LOW (2 hours)
+### I. Fuse step_raw + post_step_raw
+- **Expected impact**: NEGLIGIBLE (~0.04ms/step = 0.5% of total)
+- **Effort**: LOW
+- **Notes**: post_step_raw is only 1.2% of time. Not worth the code complexity.
 
-### L. JAX/XLA Full Rewrite
-- **Expected impact**: HIGH but GPU-focused
+### J. JAX/XLA Full Rewrite
+- **Expected impact**: HIGH but only with GPU
 - **Effort**: VERY HIGH (1-2 weeks)
 - **References**: PureJaxRL, Pgx
-
-### M. MLX (Apple Silicon native)
-- **Expected impact**: UNKNOWN
-- **Effort**: HIGH (2-3 days)
 
 ## Research References
 
