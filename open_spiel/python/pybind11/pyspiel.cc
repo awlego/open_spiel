@@ -36,6 +36,7 @@
 #include "open_spiel/observer.h"
 #include "open_spiel/pybind11_json/include/pybind11_json/pybind11_json.hpp"
 #include "open_spiel/python/pybind11/algorithms_corr_dist.h"
+#include "open_spiel/python/pybind11/batch_stepper.h"
 // Disabled while tests aren't passing. See GitHub issue #1502.
 // #include "open_spiel/python/pybind11/algorithms_infostate_tree.h"
 #include "open_spiel/python/pybind11/algorithms_trajectories.h"
@@ -813,6 +814,7 @@ PYBIND11_MODULE(pyspiel, m) {
   //                                           PyExc_RuntimeError);
 
   // Register other bits of the API.
+  init_pyspiel_batch_stepper(m);             // Vectorized env stepping.
   init_pyspiel_bots(m);                     // Bots and bot-related algorithms.
   init_pyspiel_policy(m);                   // Policies and related algorithms.
   init_pyspiel_algorithms_corr_dist(m);     // Correlated eq. distance funcs

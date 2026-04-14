@@ -269,6 +269,7 @@ class NashPGAgent:
     # Async learn: double-buffered rollout with background learn thread
     self._async_learn = async_learn
     self._learn_thread = None
+    self._inference_network = None
     if async_learn:
       # Allocate a second set of rollout buffers
       self._buffers = [

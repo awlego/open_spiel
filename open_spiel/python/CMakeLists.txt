@@ -33,6 +33,8 @@ set(PYTHON_BINDINGS ${PYTHON_BINDINGS}
   # pybind11/algorithms_infostate_tree.h
   pybind11/algorithms_corr_dist.cc
   pybind11/algorithms_corr_dist.h
+  pybind11/batch_stepper.cc
+  pybind11/batch_stepper.h
   pybind11/algorithms_trajectories.cc
   pybind11/algorithms_trajectories.h
   pybind11/bots.cc

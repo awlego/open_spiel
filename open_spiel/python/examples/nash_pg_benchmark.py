@@ -91,6 +91,8 @@ flags.DEFINE_bool("compile_inference", False,
                   "Use torch.compile on inference network.")
 flags.DEFINE_bool("spinwait", False,
                   "Use spin-wait synchronization (lower latency, uses more CPU).")
+flags.DEFINE_bool("raw_worker", False,
+                  "Use raw pyspiel worker (bypass rl_environment wrapper).")
 flags.DEFINE_integer("num_threads", 0,
                      "PyTorch CPU threads (0=default). Try 1 for small batches.")
 flags.DEFINE_integer("seed", 42, "Random seed.")
@@ -436,6 +438,9 @@ def _create_envs_and_agent():
         num_workers=FLAGS.num_workers,
         env_constructor=_make_env,
         use_spinwait=FLAGS.spinwait,
+        use_raw_worker=FLAGS.raw_worker,
+        game_name=FLAGS.game,
+        game_params={"enriched_obs": True},
     )
   else:
     envs = SyncVectorEnv([_make_env() for _ in range(FLAGS.num_envs)])

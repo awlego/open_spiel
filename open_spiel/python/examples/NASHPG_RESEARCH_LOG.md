@@ -201,15 +201,40 @@ Priority reordered based on profiling. With async+MPS, the bottleneck is agent.s
 - **Effort**: LOW
 - **Description**: May allow fewer PPO epochs or larger learning rate for same convergence, indirectly improving wall-clock time.
 
-### I. Fuse step_raw + post_step_raw
-- **Expected impact**: NEGLIGIBLE (~0.04ms/step = 0.5% of total)
-- **Effort**: LOW
-- **Notes**: post_step_raw is only 1.2% of time. Not worth the code complexity.
+### I. Raw Pyspiel Worker (bypass rl_environment wrapper)
+- **Status**: DONE - SMALL WIN (+3.8%)
+- **Result**: 24,313 → 25,246 steps/s (+3.8%)
+- **Notes**: Bypasses rl_environment.Environment in worker processes, calling pyspiel.State directly. env.step() dropped 14% (1.12s → 0.96s). Still has per-call pybind11 overhead (~10 calls per env step). Implementation added as `_raw_worker_loop` in vector_env.py with `use_raw_worker=True` flag.
 
-### J. JAX/XLA Full Rewrite
-- **Expected impact**: HIGH but only with GPU
-- **Effort**: VERY HIGH (1-2 weeks)
-- **References**: PureJaxRL, Pgx
+### J. EnvPool-Style Async Queue (replace barrier sync)
+- **Expected impact**: MEDIUM (~9% overall, eliminates 0.237ms/step barrier)
+- **Effort**: HIGH (1-2 days)
+- **Description**: Replace barrier-based synchronization with non-blocking queues (ActionBufferQueue → ThreadPool → StateBufferQueue pattern from EnvPool). Workers pick up actions and submit results independently. Main thread reads results as they arrive.
+- **Key advantage**: Eliminates the 0.237ms/step barrier sync overhead AND allows faster workers to proceed without waiting for slower ones (load imbalance improvement).
+- **References**: EnvPool (https://github.com/sail-sg/envpool), arxiv:2206.10558
+
+### K. Triple Buffering (env + inference + learn overlap)
+- **Expected impact**: MEDIUM -- allows all three stages to overlap
+- **Effort**: MEDIUM (4-8 hours)
+- **Description**: Extension of double-buffering. Three buffer sets: one being filled by env+inference, one being learned from, one ready for the next learn cycle. Currently we have double-buffering (env+inference overlaps with learn), but the learn thread must finish before we can swap. Triple buffering eliminates this constraint.
+- **References**: Sample Factory architecture, RLinf elastic pipelining
+
+### L. Learning Rate Tuning (lr=5e-4)
+- **Status**: TESTING -- convergence test running
+- **Preliminary**: lr=5e-4 showed ~15% faster per-update convergence than lr=3e-4 in a contended run (3 tests sharing CPU). Solo test in progress.
+- **Notes**: Algorithmic speedup -- same throughput, fewer updates needed for same performance.
+
+### M. C++ BatchStepper (in pyspiel module)
+- **Status**: CODE WRITTEN, ABI ISSUE
+- **Code**: `batch_stepper.cc/h` written and compiles into locally-built pyspiel.so, but locally-built pyspiel.so has ABI incompatibility with pip-installed dependencies. Needs full source build of OpenSpiel with matching dependencies.
+- **Expected impact**: HIGH (+20-30%), replaces all pybind11 per-env calls with a single batch call
+- **Notes**: The code is ready; the deployment issue is separate from the optimization itself.
+
+### N. RLinf-Style Elastic Pipelining
+- **Expected impact**: UNKNOWN (1.07-2.43x reported for their system)
+- **Effort**: HIGH
+- **Description**: Automatic decomposition of RL training into pipeline stages with profiling-guided scheduling. May be overkill for single-machine, but the principle of elastic overlapping is sound.
+- **References**: RLinf (arxiv:2509.15965, https://github.com/RLinf/RLinf)
 
 ## Research References
 
@@ -220,3 +245,6 @@ Priority reordered based on profiling. With async+MPS, the bottleneck is agent.s
 - Pgx: https://github.com/sotetsuk/pgx (arxiv:2303.17503)
 - Resource-Efficient RL for Board Games (KLENT): arxiv:2602.10894
 - Policy Gradient for Imperfect-Info Games: arxiv:2502.08938
+- RLinf: https://github.com/RLinf/RLinf (arxiv:2509.15965) -- elastic pipelining for RL
+- Apple Silicon ML profiling: arxiv:2501.14925
+- PyTorch MPS guide: https://developer.apple.com/metal/pytorch/
