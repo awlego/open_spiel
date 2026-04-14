@@ -291,9 +291,13 @@ The default 4 epochs x 4 minibatches = 16 forward+backward passes per update. Re
 - For throughput, always run with `--num_runs=3` and compare against baselines: 7,124 (original), 14,196 (raw+6w).
 - For convergence, use `--convergence --convergence_updates=1000 --convergence_eval_every=100 --convergence_eval_games=1000` (~8 min quick test). Compare `score_to_target`.
 - For full convergence tests, use `--convergence_updates=5000` (~35 min).
-- **Reference convergence milestones** (from v3 training runs with 128x128 network -- need to re-establish for 512x512):
-  - 128x128: ~40% committer WR at ~5,000 updates, ~50% at ~15,000
-  - 512x512: TBD
+- **Reference convergence milestones** (512x512 with async+MPS, 2026-04-13):
+  - ~35% committer WR at ~2,000 updates (~11 min)
+  - ~40% WR at ~3,000 updates (~17 min)
+  - ~42% WR at ~4,000-5,000 updates (~23-29 min)
+  - score > -20 at ~1,500 updates (~8 min)
+  - score > -10 at ~3,500 updates (~20 min)
+  - For comparison, 128x128 needed ~5,000 updates for 40% WR
 - When testing hyperparameter changes, use convergence mode to validate.
 - Max 6 worker processes (hard cap in both benchmark and training scripts).
 - **Research log**: See `NASHPG_RESEARCH_LOG.md` for prioritized experiment ideas.
