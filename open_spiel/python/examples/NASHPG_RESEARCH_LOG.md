@@ -51,6 +51,15 @@ targeting learn() (PPO forward+backward passes) will have the highest impact.
 - **Result**: 14,196 → 24,625 steps/s (+73%)
 - **Notes**: Fixed race condition by adding a separate CPU inference network for step_raw(). Main network moves to MPS for learn(), inference network stays on CPU for rollout. Weights synced after each learn(). Combines the best of async overlap (no blocking) and MPS acceleration (faster PPO epochs). learn() appears as only 9.6% of time.
 - **Implementation**: Added _inference_network (CPU copy), step_raw uses it when available. _run_ppo_epochs syncs weights back after completion.
+- **Convergence validated**: 1000-update test shows nearly 2x faster wall-clock convergence (score > -30 at 3.2 min vs 6.2 min CPU sync). 1-step policy lag has no measurable negative impact.
+
+### 8. Batch Size Scaling with Async+MPS
+- **Status**: DONE - 128 envs slightly better but high variance
+- **Results** (all with async+MPS):
+  - 64 envs: 24,625 steps/s (stable, range 24.4k-24.9k)
+  - 96 envs: 21,180 steps/s (slower -- more env overhead not amortized)
+  - 128 envs: 27,343 steps/s (avg +11%, but range 25.1k-31.0k -- unstable)
+- **Notes**: 64 envs remains the recommended default for stability. 128 envs has potential but needs more testing.
 
 ### 7. MPS for learn() Only (sync)
 - **Status**: DONE - SIGNIFICANT WIN (+18.6%)
