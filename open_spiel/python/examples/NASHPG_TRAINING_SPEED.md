@@ -86,31 +86,34 @@ PYTHONPATH=. env3.12/bin/python open_spiel/python/examples/nash_pg_profile.py \
 4. **Evaluation**: Every 50 updates, play 5,000 games vs random + 5,000 vs CommitterBot
 
 ### Network
-- **Actor**: 517 -> 128 -> 128 -> 151 (MLP with ReLU)
-- **Critic**: 517 -> 128 -> 128 -> 1 (separate MLP)
+- **Actor**: 517 -> 512 -> 512 -> 151 (MLP with ReLU)
+- **Critic**: 517 -> 512 -> 512 -> 1 (separate MLP)
 - **Observation**: 517-dim enriched tensor (card locations, per-suit features, derived stats)
 - **Actions**: 151 (72 play + 72 discard + 1 deck draw + 6 discard pile draws)
+- **Parameters**: ~660K (16x larger than previous 128x128 network)
 
 ### Environment
 - Lost Cities C++ game via OpenSpiel Python bindings
 - `SyncVectorEnv`: sequential, in-process (default)
 - `SubprocVectorEnv`: multiprocess with shared memory (use `--num_workers=N`)
 
-## Baseline Measurements (M1 Max, 2026-04-13)
+## Baseline Measurements (512x512 network, M1 Max, 2026-04-13)
 
-**Config**: 64 envs, 128 steps/rollout, batch_size=8192, net=(128,128), SyncVectorEnv
+**Config**: 64 envs, 128 steps/rollout, batch_size=8192, net=(512,512), SyncVectorEnv
 
 | Metric | Value |
 |--------|-------|
-| **Steps/sec** | **8,954** (range: 8,826 - 9,042) |
-| agent.step() | 2.41s (26.4%) |
-| env.step() | 4.15s (45.4%) |
-| post_step() | 0.05s (0.6%) |
-| learn() | 2.00s (21.9%) |
-| other | 5.8% |
+| **Steps/sec** | **7,124** (range: 7,072 - 7,227) |
+| agent.step() | 2.75s (23.9%) |
+| env.step() | 4.20s (36.5%) |
+| post_step() | 0.06s (0.5%) |
+| learn() | 3.97s (34.5%) |
+| other | 4.6% |
+
+**With raw path + 6 workers**: **14,196 steps/s** (learn 57.7%, env 21.8%, agent 20.1%)
 
 ### Key Insight
-The dominant bottleneck is **env.step() at 45%** -- this is Python calling `rl_environment.Environment.step()` 64 times sequentially in SyncVectorEnv. Second is **agent.step() at 26%** -- mostly Python overhead (loop over 64 TimeStep objects to extract observations into numpy arrays). The neural network forward pass itself is fast (small model).
+With the 512x512 network, **learn() dominates at 58%** of time (with raw+6workers). The larger network means more compute per PPO forward+backward pass. Optimizations targeting learn() (torch.compile, MPS GPU, shared trunk, async overlap) are the highest priority. env.step() is now only 22% of time.
 
 ## Benchmarking Methodology
 
@@ -122,7 +125,7 @@ The dominant bottleneck is **env.step() at 45%** -- this is Python calling `rl_e
      --experiment_label="your_change_name" --num_runs=3
    ```
 3. Results are printed and appended to `benchmark_results.jsonl`
-4. Compare steps/s with baseline (8,954)
+4. Compare steps/s with baseline (7,124 original, 14,196 raw+6w)
 
 ### Tips
 - Always use `--num_runs=3` minimum for reliable comparison
@@ -130,76 +133,50 @@ The dominant bottleneck is **env.step() at 45%** -- this is Python calling `rl_e
 - The benchmark uses SyncVectorEnv (single process) for reproducibility
 - Warmup (2 updates) is excluded from timing
 
-## Optimization Backlog (Prioritized)
+## Optimization Backlog (Prioritized for 512x512 network)
 
-### Tier 1: High Impact, Low Effort
+Note: learn() is the dominant bottleneck at 58% with raw+6workers. Priorities differ from 128x128.
+See `NASHPG_RESEARCH_LOG.md` for the full list of ideas with detailed descriptions and references.
 
-#### 1. Use SubprocVectorEnv with Multiple Workers
-- **What**: Already implemented. Just pass `--num_workers=4` or `--num_workers=6`.
-- **Expected impact**: 2-3x on env.step() (45% of total), so ~1.5-2x overall
-- **Effort**: Zero (flag change)
-- **Risk**: Fork context on macOS may have issues. Monitor for hangs.
-- **How to test**: Run training with `--num_workers=4` and compare steps/s
+### Tier 1: High Impact
 
-#### 2. Bypass TimeStep Object Construction
-- **What**: The hot path creates 64 `TimeStep` Python objects per step, which the agent immediately unpacks back into numpy arrays. Add a `step_raw()` method to SyncVectorEnv that returns numpy arrays directly.
-- **Expected impact**: 30-50% reduction in agent.step() + env.step() Python overhead
-- **Effort**: Medium (2-3 hours). Need raw array path in both SyncVectorEnv and SubprocVectorEnv, plus agent changes.
-- **Where**: `vector_env.py` (add `step_raw()`), `nash_pg.py` (modify `step()` to accept raw arrays)
-- **Details**: SyncVectorEnv.step() returns list of TimeStep. Each TimeStep is a namedtuple with nested dicts. The agent loops over these to extract `info_state[pid]` and `legal_actions[pid]` into pre-allocated numpy buffers. Instead, the env should write directly into numpy buffers. SubprocVectorEnv already has shared memory arrays -- just expose them directly.
+#### 1. torch.compile / MPS GPU -- RETEST from 128x128
+- Both were dead ends on 128x128 (network too small). With 512-wide layers (16x more compute), they may now help significantly, especially for the learn() phase.
+- **Effort**: Low (minutes to test)
 
-#### 3. Vectorize GAE player_sign Computation
-- **What**: In `learn()`, the GAE loop constructs a `player_sign` tensor via a Python list comprehension `[1.0 if ... else -1.0 for i in range(num_envs)]` at each of 128 timesteps. Pre-compute all signs in one numpy operation.
-- **Expected impact**: 10-15% reduction in learn() time
-- **Effort**: Low (30 minutes)
-- **Where**: `nash_pg.py` lines 371-374
+#### 2. Async Rollout + Learn (Double Buffering)
+- Overlap learn() (58%) with rollout collection (42%). Theoretical max: time = max(58%, 42%) → ~1.7x.
+- **Effort**: High (1-2 days)
 
-### Tier 2: Medium Impact, Medium Effort
+#### 3. Fused Actor-Critic Shared Trunk
+- Actor and critic both have 517→512→512 trunks. Sharing the first layer saves one 517×512 matmul per forward pass.
+- **Effort**: Low (1-2 hours)
 
-#### 4. Vectorize post_step() Reward Extraction
-- **What**: `post_step()` creates tensors via list comprehension every call. Pre-allocate buffers.
-- **Expected impact**: post_step() is only 0.6% of total, so minimal overall impact
-- **Effort**: Low (30 minutes)
-- **Where**: `nash_pg.py` lines 324-329
+### Tier 2: Already Implemented
 
-#### 5. torch.compile() the Network Forward Pass
-- **What**: `self._network = torch.compile(self._network)` to fuse operations.
-- **Expected impact**: Uncertain on M1 CPU. 10-30% faster forward pass if compilation succeeds. Network is small so overhead may dominate.
-- **Effort**: Low (1 line + testing), but compilation adds 30-60s startup.
-- **Where**: `nash_pg.py` after network initialization
+#### 4. Raw Array Path + SubprocVectorEnv (DONE)
+- Bypasses TimeStep/StepOutput Python objects + 6 parallel workers.
+- Result: 7,124 → 14,196 steps/s (+99%)
 
-#### 6. MPS GPU for learn() Phase Only
-- **What**: Keep rollout collection on CPU (batch size 64 is too small for GPU), move to MPS only during learn() (batch size 2048+ per minibatch).
-- **Expected impact**: Potentially 1.5-2x for learn() phase (22% of total), so ~10-15% overall
-- **Effort**: Medium (1-2 hours). Need `.to(device)` at the right boundaries.
-- **Risk**: MPS has limited float64 support, no AMP. Stick with float32.
+#### 5. Vectorized GAE + JIT Trace (DONE, negligible on 512x512)
+- Still in codebase (no harm) but doesn't move the needle with larger network.
 
-#### 7. Reduce Evaluation Overhead
-- **What**: Default: 5,000 games vs random + 5,000 vs CommitterBot every 50 updates. This may dominate wall-clock for longer training runs.
-- **Options**: `--eval_games=2000 --eval_every=100` reduces eval by 4x
-- **Where**: Flags in `nash_pg_lost_cities_v2_pytorch.py`
-
-### Tier 3: High Impact, High Effort
-
-#### 8. C++ Batched Environment Step
-- **What**: EnvPool-style approach: step N game states in C++ and return numpy arrays directly via pybind11, bypassing all Python rl_environment wrapping.
-- **Expected impact**: 3-10x on environment stepping. This is the ultimate optimization.
-- **Effort**: High (1-2 days). Requires C++ pybind11 work.
-- **Where**: New file in `open_spiel/python/` or `open_spiel/games/lost_cities/`
-
-## Completed Experiments
+## Completed Experiments (512x512 network)
 
 | Date | Experiment | Steps/sec | vs Baseline | Notes |
 |------|-----------|-----------|-------------|-------|
-| 2026-04-13 | baseline | 8,954 | -- | SyncVectorEnv, 64 envs, 128 steps |
-| 2026-04-13 | inference_mode | 8,827 | -1.4% (noise) | torch.inference_mode() replacing torch.no_grad(). No measurable difference -- network too small for view-tracking overhead to matter. Change kept as correct practice. |
-| 2026-04-13 | raw_array_path | 12,269 | **+37%** | Bypass TimeStep/StepOutput construction. SyncVectorEnv, 1 worker. |
-| 2026-04-13 | raw + 2 workers | 13,740 | **+53%** | SubprocVectorEnv with 2 worker processes. |
-| 2026-04-13 | raw + 4 workers | 17,180 | **+92%** | SubprocVectorEnv with 4 worker processes. |
-| 2026-04-13 | raw + 6 workers | 18,737 | **+109%** | SubprocVectorEnv with 6 workers. Sweet spot on M1 Max. |
-| 2026-04-13 | raw + 8 workers | 18,032 | **+101%** | Diminishing returns past 6 workers (barrier sync overhead). |
-| 2026-04-13 | raw + 6w + 4ep4mb | 20,248 | **+126%** | Same-session raw+6workers with default hyperparams (comparison point). |
-| 2026-04-13 | raw + 6w + 2ep2mb | 28,910 | **+223%** | 2 epochs x 2 minibatches (4 PPO passes instead of 16). Hyperparameter tradeoff -- needs training validation. |
+| 2026-04-13 | 512x512 baseline | 7,124 | -- | SyncVectorEnv, 64 envs, 128 steps, no raw path |
+| 2026-04-13 | raw + 6 workers | 14,196 | **+99%** | Raw array path + SubprocVectorEnv. learn() becomes 58% of time. |
+| 2026-04-13 | raw + 6w + JIT + GAE | 13,850 | +94% | JIT trace + vectorized GAE: no measurable benefit with 512x512. |
+
+### Previous experiments (128x128 network, archived)
+
+See `NASHPG_RESEARCH_LOG_128x128_ARCHIVED.md` for full 128x128 results. Key findings:
+- Raw path + 6 workers reached 20,248 steps/s (2.3x over 128x128 baseline of 8,954)
+- JIT trace + vectorized GAE added +11.8% on 128x128 (negligible on 512x512)
+- 2ep2mb: +43% throughput but convergence regressed in wall-clock time
+- Dead ends on 128x128: torch.compile (1.02x), MPS (0.53x), OMP_NUM_THREADS=1 (-28%)
+- These dead ends may need retesting on 512x512 where the compute profile is different
 
 ### Raw Array Path Details (Experiment 2)
 
@@ -273,23 +250,44 @@ The default 4 epochs x 4 minibatches = 16 forward+backward passes per update. Re
 
 **Combined with raw+6workers**: 20,248 (default hyperparams) vs 28,910 (2ep x 2mb) = **+43% from hyperparameter change alone**.
 
-**Tradeoff**: Fewer PPO passes = less sample efficiency per batch. This needs a real training run to validate that convergence speed (win rate vs wall-clock) doesn't regress. The 2ep x 2mb config (4 passes) is a conservative choice -- many PPO implementations use 3-10 epochs total.
+**Convergence validation (2026-04-13)**: 2ep2mb converges SLOWER in wall-clock time than 4ep4mb despite 1.5x throughput:
+
+| Metric | 4ep4mb (default) | 2ep2mb |
+|--------|-----------------|--------|
+| Throughput (w/ eval) | ~15k steps/s | ~23k steps/s |
+| score > -40 | **3.8 min** | 4.1 min |
+| score > -30 | **5.7 min** | not reached |
+| Final WR (1000 updates) | **29.6%** | 21.8% |
+| Final score | **-21.3** | -30.3 |
+
+**Conclusion**: 4ep4mb (16 PPO passes) is the correct default. The reduced sample efficiency per batch outweighs the raw throughput gain. Do NOT use 2ep2mb.
 
 **Files changed**: `nash_pg_benchmark.py` (added `--update_epochs`, `--num_minibatches` flags)
 
+### Vectorized GAE + JIT Trace (Experiments 5-6, 2026-04-13)
+
+**Vectorized GAE player_sign**: Replaced Python list comprehension with `np.where` for the player sign computation in the GAE loop (runs 128 times per learn()). +6.6% throughput.
+
+**JIT trace**: Applied `torch.jit.trace` to the actor and critic `nn.Sequential` sub-modules. These are pure matmul+ReLU chains with no control flow, ideal for tracing. +5% throughput. Both actor/critic in the main network and magnetic reference network are traced.
+
+**Combined improvement**: 20,248 → 22,645 steps/s = **+11.8%** with raw+6workers and default 4ep4mb.
+
+**Batch size experiments**: Also tested 32/128 envs and 256 steps. 64 envs × 128 steps is the sweet spot. Fewer envs underutilizes workers; more envs/steps increases absolute env and learn time. OMP_NUM_THREADS=1 is also worse (-28%) -- multi-threaded BLAS helps even for batch-64.
+
+**Files changed**: `nash_pg.py` (vectorized player_sign, JIT trace in __init__)
+
 ## Notes for Future Claude Sessions
 
+- **Network changed to 512x512** on 2026-04-13. Previous 128x128 results are archived.
 - The benchmark script (`nash_pg_benchmark.py`) appends to `benchmark_results.jsonl`. Read this file to see all past experiments.
 - **Two benchmark modes**: `--convergence` for training quality (win rate vs wall-clock), default for throughput (steps/s).
-- For throughput, always run with `--num_runs=3` and compare against the baseline range (8,826 - 9,042).
-- For convergence, use `--convergence --convergence_updates=5000` (~35 min with raw+6workers). Compares time-to-target for committer WR thresholds.
-- For **quick tests (~8 min)**: use `--convergence_updates=1000 --convergence_eval_every=100 --convergence_eval_games=1000`. Compare `score_to_target` (time to reach score > -40, -30, -20). Score > -20 is reachable within ~5 min.
-- For **full tests (~35 min)**: use defaults (`--convergence_updates=5000`). Compare `wr_to_target` (time to reach 35%, 40% committer WR).
-- **Reference convergence milestones** (from v3 training runs with 128x128 network):
-  - ~40% committer WR at ~5,000 updates (41M steps)
-  - ~45% at ~10,000 updates (82M steps)
-  - ~50% at ~15,000-20,000 updates
-  - ~55% at ~25,000 updates
-  - ~60% at ~40,000-45,000 updates
-- When testing hyperparameter changes (epochs, minibatches, learning rate), use convergence mode to validate that faster throughput translates to faster convergence.
+- For throughput, always run with `--num_runs=3` and compare against baselines: 7,124 (original), 14,196 (raw+6w).
+- For convergence, use `--convergence --convergence_updates=1000 --convergence_eval_every=100 --convergence_eval_games=1000` (~8 min quick test). Compare `score_to_target`.
+- For full convergence tests, use `--convergence_updates=5000` (~35 min).
+- **Reference convergence milestones** (from v3 training runs with 128x128 network -- need to re-establish for 512x512):
+  - 128x128: ~40% committer WR at ~5,000 updates, ~50% at ~15,000
+  - 512x512: TBD
+- When testing hyperparameter changes, use convergence mode to validate.
 - Max 6 worker processes (hard cap in both benchmark and training scripts).
+- **Research log**: See `NASHPG_RESEARCH_LOG.md` for prioritized experiment ideas.
+- **Archived**: `NASHPG_RESEARCH_LOG_128x128_ARCHIVED.md` has full 128x128 experiment history.

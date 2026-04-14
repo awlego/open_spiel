@@ -56,8 +56,8 @@ class NashPGNetwork(nn.Module):
   """Separate actor-critic network for NashPG."""
 
   def __init__(self, info_state_size, num_actions,
-               actor_hidden_layers_sizes=(128, 128),
-               critic_hidden_layers_sizes=(128, 128)):
+               actor_hidden_layers_sizes=(512, 512),
+               critic_hidden_layers_sizes=(512, 512)):
     super().__init__()
     self.num_actions = num_actions
 
@@ -123,7 +123,7 @@ class NashPGAgent:
                num_actions,
                num_envs,
                steps_per_batch,
-               hidden_layers_sizes=(128, 128),
+               hidden_layers_sizes=(512, 512),
                actor_hidden_layers_sizes=None,
                critic_hidden_layers_sizes=None,
                learning_rate=3e-4,
@@ -201,6 +201,16 @@ class NashPGAgent:
     for p in self._magnetic_network.parameters():
       p.requires_grad = False
 
+    # JIT-trace actor and critic for faster inference.
+    # Only the actor/critic Sequential modules are traced (no control flow).
+    dummy_obs = torch.zeros((num_envs, info_state_size), device=self._device)
+    self._network.actor = torch.jit.trace(self._network.actor, dummy_obs)
+    self._network.critic = torch.jit.trace(self._network.critic, dummy_obs)
+    self._magnetic_network.actor = torch.jit.trace(
+        self._magnetic_network.actor, dummy_obs)
+    self._magnetic_network.critic = torch.jit.trace(
+        self._magnetic_network.critic, dummy_obs)
+
     self._optimizer = optim.Adam(
         self._network.parameters(), lr=learning_rate, eps=1e-5)
 
@@ -230,6 +240,9 @@ class NashPGAgent:
         (num_envs, info_state_size), dtype=np.float32)
     self._step_mask = torch.zeros(
         (num_envs, num_actions), dtype=torch.bool, device=self._device)
+
+    # Pre-allocated buffer for GAE player_sign computation
+    self._player_sign_np = np.empty(num_envs, dtype=np.float32)
 
     self.cur_batch_idx = 0
     self.total_steps_done = 0
@@ -398,10 +411,10 @@ class NashPGAgent:
           nextvalues = self.values[t + 1]
           next_acting = self._acting_players[t + 1]
 
-        player_sign = torch.tensor(
-            [1.0 if self._acting_players[t][i] == next_acting[i] else -1.0
-             for i in range(self._num_envs)],
-            dtype=torch.float32, device=self._device)
+        # Vectorized player_sign: +1 same player, -1 different (zero-sum)
+        self._player_sign_np[:] = np.where(
+            self._acting_players[t] == next_acting, 1.0, -1.0)
+        player_sign = torch.from_numpy(self._player_sign_np)
 
         nextnonterminal = 1.0 - self.dones[t]
         delta = (self.rewards[t]
@@ -424,8 +437,7 @@ class NashPGAgent:
     with torch.inference_mode():
       mag_logits = self._magnetic_network.get_policy_logits(b_obs)
       mag_logits = torch.where(
-          b_legal_masks, mag_logits,
-          torch.tensor(INVALID_ACTION_PENALTY, device=self._device))
+          b_legal_masks, mag_logits, self._network.mask_value)
       mag_log_probs = F.log_softmax(mag_logits, dim=-1)
       mag_probs = F.softmax(mag_logits, dim=-1)
 
@@ -537,11 +549,10 @@ class NashPGAgent:
           nextvalues = self.values[t + 1]
           next_acting = self._acting_players[t + 1]
 
-        # Sign correction: -1 when next player differs (zero-sum)
-        player_sign = torch.tensor(
-            [1.0 if self._acting_players[t][i] == next_acting[i] else -1.0
-             for i in range(self._num_envs)],
-            dtype=torch.float32, device=self._device)
+        # Vectorized player_sign: +1 same player, -1 different (zero-sum)
+        self._player_sign_np[:] = np.where(
+            self._acting_players[t] == next_acting, 1.0, -1.0)
+        player_sign = torch.from_numpy(self._player_sign_np)
 
         nextnonterminal = 1.0 - self.dones[t]
         delta = (self.rewards[t]
@@ -565,8 +576,7 @@ class NashPGAgent:
     with torch.inference_mode():
       mag_logits = self._magnetic_network.get_policy_logits(b_obs)
       mag_logits = torch.where(
-          b_legal_masks, mag_logits,
-          torch.tensor(INVALID_ACTION_PENALTY, device=self._device))
+          b_legal_masks, mag_logits, self._network.mask_value)
       mag_log_probs = F.log_softmax(mag_logits, dim=-1)
       mag_probs = F.softmax(mag_logits, dim=-1)
 

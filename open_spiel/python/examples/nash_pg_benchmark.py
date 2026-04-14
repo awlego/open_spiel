@@ -60,7 +60,7 @@ flags.DEFINE_integer("num_steps", 128, "Steps per rollout.")
 flags.DEFINE_integer("num_updates", 10, "Number of updates to benchmark.")
 flags.DEFINE_integer("warmup_updates", 2, "Warmup updates (excluded from timing).")
 flags.DEFINE_string("game", "lost_cities", "Game to benchmark.")
-flags.DEFINE_string("hidden_layers_sizes", "128,128",
+flags.DEFINE_string("hidden_layers_sizes", "512,512",
                     "Comma-separated hidden layer sizes.")
 flags.DEFINE_string("experiment_label", "", "Label for this experiment run.")
 flags.DEFINE_string("results_file", "benchmark_results.jsonl",

@@ -39,7 +39,7 @@ flags.DEFINE_integer("num_envs", 16, "Number of parallel environments.")
 flags.DEFINE_integer("num_steps", 128, "Steps per rollout.")
 flags.DEFINE_integer("num_updates", 10, "Number of updates to profile.")
 flags.DEFINE_string("game", "lost_cities", "Game to profile.")
-flags.DEFINE_string("hidden_layers_sizes", "128,128",
+flags.DEFINE_string("hidden_layers_sizes", "512,512",
                     "Comma-separated hidden layer sizes (e.g. '64,64').")
 
 

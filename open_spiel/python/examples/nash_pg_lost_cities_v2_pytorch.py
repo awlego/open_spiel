@@ -61,7 +61,7 @@ flags.DEFINE_integer("eval_games", 5000,
                      "Number of games per evaluation round.")
 flags.DEFINE_integer("checkpoint_every", 200,
                      "Update frequency at which checkpoints are saved.")
-flags.DEFINE_list("hidden_layers_sizes", [128, 128],
+flags.DEFINE_list("hidden_layers_sizes", [512, 512],
                   "Default hidden layer sizes (used when actor/critic sizes "
                   "not specified).")
 flags.DEFINE_list("actor_hidden_layers_sizes", None,

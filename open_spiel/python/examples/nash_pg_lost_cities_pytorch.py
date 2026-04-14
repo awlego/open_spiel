@@ -59,7 +59,7 @@ flags.DEFINE_integer("eval_games", 5000,
                      "Number of games per evaluation round.")
 flags.DEFINE_integer("checkpoint_every", 200,
                      "Update frequency at which checkpoints are saved.")
-flags.DEFINE_list("hidden_layers_sizes", [128, 128],
+flags.DEFINE_list("hidden_layers_sizes", [512, 512],
                   "Hidden layer sizes for actor and critic networks.")
 flags.DEFINE_float("learning_rate", 3e-4, "Learning rate for Adam optimizer.")
 flags.DEFINE_float("entropy_cost", 0.05, "Entropy bonus coefficient.")
