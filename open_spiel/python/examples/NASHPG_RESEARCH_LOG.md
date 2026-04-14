@@ -61,6 +61,11 @@ targeting learn() (PPO forward+backward passes) will have the highest impact.
   - 128 envs: 27,343 steps/s (avg +11%, but range 25.1k-31.0k -- unstable)
 - **Notes**: 64 envs remains the recommended default for stability. 128 envs has potential but needs more testing.
 
+### 9. Deferred Critic (skip critic during rollout, batch at learn time)
+- **Status**: DONE - No improvement
+- **Result**: 23,743 steps/s vs 24,625 baseline (-3.6%)
+- **Notes**: agent.step() dropped from 1.36s to 1.00s (-26%) by skipping critic. But learn() increased from 0.32s to 0.78s because the batched critic computation at learn time is not faster (likely due to the async thread join + batch being a synchronization point). Net effect is slightly negative.
+
 ### 7. MPS for learn() Only (sync)
 - **Status**: DONE - SIGNIFICANT WIN (+18.6%)
 - **Result**: 14,196 → 16,840 steps/s (+18.6%)

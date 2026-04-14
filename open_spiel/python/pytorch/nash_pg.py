@@ -108,6 +108,14 @@ class NashPGNetwork(nn.Module):
       action = dist.sample()
     return action, dist.log_prob(action), dist.entropy(), self.critic(x), dist.probs
 
+  def get_action_no_critic(self, x, legal_actions_mask):
+    """Forward pass for rollout: actor only, skip critic."""
+    logits = self.actor(x)
+    dist = CategoricalMasked(
+        logits=logits, masks=legal_actions_mask, mask_value=self.mask_value)
+    action = dist.sample()
+    return action, dist.log_prob(action)
+
 
 class NashPGAgent:
   """NashPG Agent with vectorized environment support.
@@ -141,7 +149,8 @@ class NashPGAgent:
                max_grad_norm=0.5,
                device="cpu",
                learn_device=None,
-               async_learn=False):
+               async_learn=False,
+               defer_critic=False):
     """Initialize the NashPG agent.
 
     Args:
@@ -188,6 +197,7 @@ class NashPGAgent:
     self._max_grad_norm = max_grad_norm
     self._device = torch.device(device)
     self._learn_device = torch.device(learn_device) if learn_device else None
+    self._defer_critic = defer_critic
 
     self._batch_size = num_envs * steps_per_batch
     self._minibatch_size = max(1, self._batch_size // num_minibatches)
@@ -370,13 +380,16 @@ class NashPGAgent:
     # Use inference network if available (async + learn_device mode)
     net = self._inference_network or self._network
     with torch.inference_mode():
-      action, logprob, _, value, _ = net.get_action_and_value(obs, mask)
+      if self._defer_critic:
+        action, logprob = net.get_action_no_critic(obs, mask)
+      else:
+        action, logprob, _, value, _ = net.get_action_and_value(obs, mask)
+        self.values[self.cur_batch_idx] = value.flatten()
 
     self.obs[self.cur_batch_idx] = obs
     self.legal_actions_mask[self.cur_batch_idx] = mask
     self.actions[self.cur_batch_idx] = action
     self.logprobs[self.cur_batch_idx] = logprob
-    self.values[self.cur_batch_idx] = value.flatten()
     self._acting_players[self.cur_batch_idx] = players_np
 
     return action.cpu().numpy()
@@ -462,6 +475,13 @@ class NashPGAgent:
                       else self._acting_players)
 
     with torch.inference_mode():
+      # If critic was deferred during rollout, compute all values now in batch
+      if self._defer_critic:
+        all_obs = obs.reshape(-1, self._info_state_size)
+        all_values = self._network.get_value(all_obs).reshape(
+            self._steps_per_batch, self._num_envs)
+        values[:] = all_values
+
       next_value = self._network.get_value(next_obs).reshape(1, -1)
 
       advantages = torch.zeros_like(rewards, device=self._device)

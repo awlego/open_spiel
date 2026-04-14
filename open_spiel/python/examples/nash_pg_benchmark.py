@@ -82,6 +82,8 @@ flags.DEFINE_string("learn_device", None,
                     "Torch device for learn() only (e.g. mps). None = same as device.")
 flags.DEFINE_bool("async_learn", False,
                   "Enable async double-buffered learning (learn in background thread).")
+flags.DEFINE_bool("defer_critic", False,
+                  "Defer critic computation to learn phase (skip during rollout).")
 flags.DEFINE_integer("seed", 42, "Random seed.")
 
 # Convergence mode flags.
@@ -449,6 +451,7 @@ def _create_envs_and_agent():
       device=FLAGS.device,
       learn_device=FLAGS.learn_device,
       async_learn=FLAGS.async_learn,
+      defer_critic=FLAGS.defer_critic,
   )
 
   return envs, agent, game
@@ -474,6 +477,7 @@ def _build_config():
       "device": FLAGS.device,
       "learn_device": FLAGS.learn_device,
       "async_learn": FLAGS.async_learn,
+      "defer_critic": FLAGS.defer_critic,
   }
 
 
