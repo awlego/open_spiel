@@ -239,6 +239,14 @@ Priority reordered based on profiling. With async+MPS, the bottleneck is agent.s
 - **Recommended config**: `--learning_rate=5e-4 --lr_decay` for convergence-critical training.
 - **Notes**: LR decay helps mid-training convergence but must not go to 0. The 10% floor preserves NashPG's magnetic outer loop.
 
+### Q. LayerNorm
+- **Status**: DONE - BEST FINAL QUALITY but slower throughput
+- **Result** (with lr5e4_decay): score=-5.1 (43.9% WR) at 5000 updates -- **best score ever**!
+  But 22k steps/s vs 25k (-12%), so wall-clock convergence is mixed:
+  - Worse than lr5e4_decay through 1500s wall time
+  - Catches up by 1800s, exceeds by 5000 updates
+- **Notes**: LayerNorm adds ~12% inference overhead but improves final convergence quality. Worth it for long training runs (>5000 updates). The extra per-step cost could be reduced if the C++ BatchStepper eliminates the env bottleneck.
+
 ### P. Entropy Schedule / Higher Entropy
 - **Expected impact**: POTENTIALLY POSITIVE for convergence quality
 - **Effort**: LOW
