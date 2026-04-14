@@ -58,7 +58,8 @@ class NashPGNetwork(nn.Module):
 
   def __init__(self, info_state_size, num_actions,
                actor_hidden_layers_sizes=(512, 512),
-               critic_hidden_layers_sizes=(512, 512)):
+               critic_hidden_layers_sizes=(512, 512),
+               use_layer_norm=False):
     super().__init__()
     self.num_actions = num_actions
 
@@ -67,6 +68,8 @@ class NashPGNetwork(nn.Module):
     in_size = info_state_size
     for h in actor_hidden_layers_sizes:
       actor_layers.append(layer_init(nn.Linear(in_size, h)))
+      if use_layer_norm:
+        actor_layers.append(nn.LayerNorm(h))
       actor_layers.append(nn.ReLU())
       in_size = h
     actor_layers.append(layer_init(nn.Linear(in_size, num_actions), std=0.01))
@@ -77,6 +80,8 @@ class NashPGNetwork(nn.Module):
     in_size = info_state_size
     for h in critic_hidden_layers_sizes:
       critic_layers.append(layer_init(nn.Linear(in_size, h)))
+      if use_layer_norm:
+        critic_layers.append(nn.LayerNorm(h))
       critic_layers.append(nn.ReLU())
       in_size = h
     critic_layers.append(layer_init(nn.Linear(in_size, 1), std=1.0))
@@ -162,7 +167,8 @@ class NashPGAgent:
                async_learn=False,
                defer_critic=False,
                fp16_inference=False,
-               compile_inference=False):
+               compile_inference=False,
+               use_layer_norm=False):
     """Initialize the NashPG agent.
 
     Args:
@@ -222,7 +228,8 @@ class NashPGAgent:
 
     # Networks
     self._network = NashPGNetwork(
-        info_state_size, num_actions, actor_sizes, critic_sizes
+        info_state_size, num_actions, actor_sizes, critic_sizes,
+        use_layer_norm=use_layer_norm,
     ).to(self._device)
     self._magnetic_network = copy.deepcopy(self._network).to(self._device)
     self._magnetic_network.eval()

@@ -231,7 +231,12 @@ Priority reordered based on profiling. With async+MPS, the bottleneck is agent.s
   - Update 3000: score=-11.5, 36.5% vs baseline -10.5, 39.8% -- worse (LR decayed to 0, lost learning ability)
 - **Key insight**: NashPG needs non-zero LR for the magnetic outer loop to work. Decaying to 0 breaks the algorithm's monotonic improvement guarantee.
 - **v2 Result (3e-4 → 3e-5, 5000 updates)**: Roughly equivalent to baseline. Score -8.1 (41.1% WR) vs baseline -8.4 (42.0% WR) at 5000 updates. Slightly worse in middle, catches up by end.
-- **v3 (5e-4 → 5e-5, 5000 updates)**: TESTING. Combines higher initial LR for faster early convergence with decay for late stability.
+- **v3 Result (5e-4 → 5e-5, 5000 updates)**: **BEST CONFIG** -- significantly better convergence!
+  - Update 2000: score=-11.7 (38.0%) vs baseline -14.3 (34.8%) -- **+3.2% WR**
+  - Update 3500: score=-7.4 (43.9%) vs baseline -9.6 (40.1%) -- **+3.8% WR**
+  - Update 5000: score=-6.6 (42.5%) vs baseline -8.4 (42.0%) -- **score -1.8 better**
+  - Higher initial LR allows faster early convergence, decay provides late stability.
+- **Recommended config**: `--learning_rate=5e-4 --lr_decay` for convergence-critical training.
 - **Notes**: LR decay helps mid-training convergence but must not go to 0. The 10% floor preserves NashPG's magnetic outer loop.
 
 ### P. Entropy Schedule / Higher Entropy

@@ -107,7 +107,9 @@ flags.DEFINE_integer("convergence_eval_every", 250,
 flags.DEFINE_integer("convergence_eval_games", 2000,
                      "Games per eval during convergence benchmark.")
 flags.DEFINE_bool("lr_decay", False,
-                  "Linear LR decay from initial to 0 over total updates.")
+                  "Linear LR decay from initial to 10% over total updates.")
+flags.DEFINE_bool("layer_norm", False,
+                  "Use LayerNorm in actor and critic networks.")
 
 
 def run_one_benchmark(envs, agent, num_updates, num_steps, num_envs,
@@ -476,6 +478,7 @@ def _create_envs_and_agent():
       defer_critic=FLAGS.defer_critic,
       fp16_inference=FLAGS.fp16_inference,
       compile_inference=FLAGS.compile_inference,
+      use_layer_norm=FLAGS.layer_norm,
   )
 
   return envs, agent, game
