@@ -195,9 +195,17 @@ def _raw_worker_loop(worker_id, env_start, env_count, game_name, game_params,
     """Resolve chance nodes until a decision or terminal node."""
     while state.is_chance_node():
       outcomes = state.chance_outcomes()
-      action_list, prob_list = zip(*outcomes)
-      chosen = pyrandom.choices(action_list, weights=prob_list, k=1)[0]
-      state.apply_action(chosen)
+      # Fast sampling: accumulate probabilities and binary search
+      r = pyrandom.random()
+      cumprob = 0.0
+      for action, prob in outcomes:
+        cumprob += prob
+        if r < cumprob:
+          state.apply_action(action)
+          break
+      else:
+        # Edge case: rounding, apply last action
+        state.apply_action(outcomes[-1][0])
 
   def _new_game(idx):
     """Create a new initial state and resolve initial chance nodes."""
@@ -216,11 +224,11 @@ def _raw_worker_loop(worker_id, env_start, env_count, game_name, game_params,
       # Write info state tensor directly
       tensor = state.information_state_tensor(p)
       obs_np[gi, p, :len(tensor)] = tensor
-      # Write legal actions mask
-      legal_np[gi, p, :] = 0
+      # Write legal actions mask using C++ mask method (faster than Python loop)
       if not state.is_terminal():
-        for a in state.legal_actions(p):
-          legal_np[gi, p, a] = 1
+        legal_np[gi, p, :] = state.legal_actions_mask(p)
+      else:
+        legal_np[gi, p, :] = 0
 
   # Initialize all states
   for j in range(env_count):

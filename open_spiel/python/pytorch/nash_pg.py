@@ -229,6 +229,7 @@ class NashPGAgent:
     for p in self._magnetic_network.parameters():
       p.requires_grad = False
 
+    self._learning_rate = learning_rate
     self._optimizer = optim.Adam(
         self._network.parameters(), lr=learning_rate, eps=1e-5)
 
@@ -703,6 +704,15 @@ class NashPGAgent:
     # Sync inference network (async + learn_device mode)
     if self._inference_network is not None:
       self._inference_network.load_state_dict(self._network.state_dict())
+
+  def set_learning_rate(self, lr):
+    """Update the optimizer's learning rate."""
+    for param_group in self._optimizer.param_groups:
+      param_group['lr'] = lr
+
+  def get_learning_rate(self):
+    """Get the current learning rate."""
+    return self._optimizer.param_groups[0]['lr']
 
   def update_magnetic_reference(self):
     """Update the magnetic reference policy by cloning the current network."""

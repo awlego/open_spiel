@@ -220,9 +220,13 @@ Priority reordered based on profiling. With async+MPS, the bottleneck is agent.s
 - **References**: Sample Factory architecture, RLinf elastic pipelining
 
 ### L. Learning Rate Tuning (lr=5e-4)
-- **Status**: TESTING -- convergence test running
-- **Preliminary**: lr=5e-4 showed ~15% faster per-update convergence than lr=3e-4 in a contended run (3 tests sharing CPU). Solo test in progress.
-- **Notes**: Algorithmic speedup -- same throughput, fewer updates needed for same performance.
+- **Status**: DONE - WORSE CONVERGENCE
+- **Result**: At 3000 updates, lr=5e-4 achieves score=-13.5 (36.5% WR) vs baseline lr=3e-4 at score=-10.5 (39.8% WR). lr=5e-4 is consistently worse from update 1000 onward.
+- **Notes**: Earlier impression of improvement was misleading (contended CPU run). The default lr=3e-4 is well-tuned for 512x512 network.
+
+### O. Learning Rate Decay
+- **Status**: TESTING -- linear decay from lr=3e-4 → 0 over total updates
+- **Notes**: Standard PPO practice from CleanRL. May help convergence in later stages when the policy should change less aggressively.
 
 ### M. C++ BatchStepper (in pyspiel module)
 - **Status**: CODE WRITTEN, ABI ISSUE
