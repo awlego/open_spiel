@@ -4,14 +4,16 @@ This document provides context for optimizing NashPG training speed on M1 Max ha
 
 ## Quick Start
 
-### Start Training
+### Start Training (fast, 3.5x speedup)
 ```bash
-PYTHONPATH=. env3.12/bin/python open_spiel/python/examples/nash_pg_lost_cities_v2_pytorch.py
+PYTHONPATH=. env3.12/bin/python open_spiel/python/examples/nash_pg_lost_cities_v2_pytorch.py \
+  --use_raw --num_workers=6 --async_learn --learn_device=mps
 ```
 
 ### Resume Training from Checkpoint
 ```bash
 PYTHONPATH=. env3.12/bin/python open_spiel/python/examples/nash_pg_lost_cities_v2_pytorch.py \
+  --use_raw --num_workers=6 --async_learn --learn_device=mps \
   --checkpoint_dir=checkpoints/lost_cities_nash_pg
 ```
 
@@ -26,20 +28,20 @@ tensorboard --logdir=runs/lost_cities_nash_pg
 PYTHONPATH=. env3.12/bin/python open_spiel/python/examples/nash_pg_benchmark.py \
   --experiment_label="baseline" --num_runs=3
 
-# With raw path + workers:
+# Best config (async + MPS learn):
 PYTHONPATH=. env3.12/bin/python open_spiel/python/examples/nash_pg_benchmark.py \
-  --experiment_label="raw_6w" --use_raw --num_workers=6 --num_runs=3
+  --experiment_label="async_mps" --use_raw --num_workers=6 \
+  --async_learn --learn_device=mps --num_runs=3
 ```
 
 ### Run Convergence Benchmark
 ```bash
-# Quick convergence test (~8 min with raw+6workers):
-# Tracks avg score vs CommitterBot (more granular than WR for short runs).
-# Score targets: -40, -30, -20, -10, 0. Typical: score > -20 at ~5 min.
+# Quick convergence test (~7 min with async+MPS):
 PYTHONPATH=. env3.12/bin/python open_spiel/python/examples/nash_pg_benchmark.py \
-  --convergence --experiment_label="quick_baseline" \
+  --convergence --experiment_label="quick_async_mps" \
   --convergence_updates=1000 --convergence_eval_every=100 \
-  --convergence_eval_games=1000 --use_raw --num_workers=6
+  --convergence_eval_games=1000 --use_raw --num_workers=6 \
+  --async_learn --learn_device=mps
 
 # Full convergence test (~35 min with raw+6workers):
 # Also tracks WR targets: 35%, 40%, 45%, 50%, 55%.
