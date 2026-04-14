@@ -116,6 +116,16 @@ class NashPGNetwork(nn.Module):
     action = dist.sample()
     return action, dist.log_prob(action)
 
+  def get_action_and_value_fast(self, x, legal_actions_mask):
+    """Fast rollout forward: manual sampling (avoids Categorical overhead)."""
+    logits = self.actor(x)
+    logits = torch.where(legal_actions_mask, logits, self.mask_value)
+    probs = F.softmax(logits, dim=-1)
+    action = torch.multinomial(probs, 1).squeeze(-1)
+    log_prob = torch.log(probs.gather(1, action.unsqueeze(1)) + 1e-10).squeeze(1)
+    value = self.critic(x)
+    return action, log_prob, value, probs
+
 
 class NashPGAgent:
   """NashPG Agent with vectorized environment support.
@@ -383,7 +393,7 @@ class NashPGAgent:
       if self._defer_critic:
         action, logprob = net.get_action_no_critic(obs, mask)
       else:
-        action, logprob, _, value, _ = net.get_action_and_value(obs, mask)
+        action, logprob, value, _ = net.get_action_and_value_fast(obs, mask)
         self.values[self.cur_batch_idx] = value.flatten()
 
     self.obs[self.cur_batch_idx] = obs
