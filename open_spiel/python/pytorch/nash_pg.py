@@ -267,9 +267,6 @@ class NashPGAgent:
     self._step_mask = torch.zeros(
         (num_envs, num_actions), dtype=torch.bool, device=self._device)
 
-    # Pre-allocated buffer for GAE player_sign computation
-    self._player_sign_np = np.empty(num_envs, dtype=np.float32)
-
     self.cur_batch_idx = 0
     self.total_steps_done = 0
     self.updates_done = 0
@@ -516,30 +513,38 @@ class NashPGAgent:
                 self._steps_per_batch, self._num_envs)
             values[:] = all_values
 
+          T = self._steps_per_batch
           next_value = self._network.get_value(next_obs).reshape(1, -1)
 
-          advantages = torch.zeros_like(rewards, device=self._device)
-          lastgaelam = 0
-          for t in reversed(range(self._steps_per_batch)):
-            if t == self._steps_per_batch - 1:
-              nextvalues = next_value
-              next_acting = next_players
-            else:
-              nextvalues = values[t + 1]
-              next_acting = acting_players[t + 1]
+          # Pre-compute nextvalues: shift values by 1, bootstrap last
+          nv = torch.empty_like(values)
+          nv[:T - 1] = values[1:]
+          nv[T - 1] = next_value
 
-            self._player_sign_np[:] = np.where(
-                acting_players[t] == next_acting, 1.0, -1.0)
-            player_sign = torch.as_tensor(
-                self._player_sign_np, device=self._device)
+          # Pre-compute player_signs as tensor (no numpy)
+          acting_t = torch.as_tensor(
+              acting_players, device=self._device)
+          next_acting_t = torch.empty_like(acting_t)
+          next_acting_t[:T - 1] = acting_t[1:]
+          next_acting_t[T - 1] = torch.as_tensor(
+              next_players, device=self._device)
+          player_signs = torch.where(
+              acting_t == next_acting_t, 1.0, -1.0)
 
-            nextnonterminal = 1.0 - dones[t]
-            delta = (rewards[t]
-                     + self._gamma * player_sign * nextvalues * nextnonterminal
-                     - values[t])
-            advantages[t] = lastgaelam = (
-                delta + self._gamma * self._gae_lambda
-                * nextnonterminal * player_sign * lastgaelam)
+          # Vectorized deltas and scan coefficients
+          nextnonterminal = 1.0 - dones  # [T, B]
+          deltas = (rewards
+                    + self._gamma * player_signs * nv * nextnonterminal
+                    - values)
+          coeffs = (self._gamma * self._gae_lambda
+                    * nextnonterminal * player_signs)
+
+          # Backward scan (minimal loop body — one multiply-add)
+          advantages = torch.empty_like(rewards)
+          advantages[T - 1] = deltas[T - 1]
+          for t in range(T - 2, -1, -1):
+            advantages[t] = deltas[t] + coeffs[t] * advantages[t + 1]
+
           returns = advantages + values
 
       b_obs = obs.reshape(-1, self._info_state_size)
@@ -647,13 +652,10 @@ class NashPGAgent:
         mag_log_probs = F.log_softmax(mag_logits, dim=-1)
         mag_probs = F.softmax(mag_logits, dim=-1)
 
-    b_inds = np.arange(self._batch_size)
-
     for _ in range(self._update_epochs):
-      np.random.shuffle(b_inds)
+      b_inds = torch.randperm(self._batch_size, device=b_obs.device)
       for start in range(0, self._batch_size, self._minibatch_size):
-        end = start + self._minibatch_size
-        mb = b_inds[start:end]
+        mb = b_inds[start:start + self._minibatch_size]
 
         with torch.profiler.record_function("ppo_minibatch"):
           _, new_log_prob, entropy, new_value, new_probs = (
@@ -682,7 +684,8 @@ class NashPGAgent:
                 new_value - b_values[mb],
                 -self._clip_coef, self._clip_coef)
             v_loss_clipped = (v_clipped - b_returns[mb]) ** 2
-            v_loss = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped).mean()
+            v_loss = 0.5 * torch.max(
+                v_loss_unclipped, v_loss_clipped).mean()
           else:
             v_loss = 0.5 * ((new_value - b_returns[mb]) ** 2).mean()
 
@@ -698,7 +701,8 @@ class NashPGAgent:
                   mb_legal).sum(dim=-1)
             mag_loss = kl.mean()
           else:
-            l2 = 0.5 * ((new_probs - mb_mag_probs) ** 2 * mb_legal).sum(dim=-1)
+            l2 = 0.5 * ((new_probs - mb_mag_probs) ** 2
+                        * mb_legal).sum(dim=-1)
             mag_loss = l2.mean()
 
           loss = (pg_loss
