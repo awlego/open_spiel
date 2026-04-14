@@ -171,7 +171,8 @@ See `NASHPG_RESEARCH_LOG.md` for the full list of ideas with detailed descriptio
 | 2026-04-13 | torch.compile | 14,574 | +104% | Marginal (+2.7% over raw+6w). Better than 128x128 but still small. |
 | 2026-04-13 | MPS GPU (full) | 8,510 | +19% | Slower overall. learn() faster (-24%) but agent.step() killed by transfers. |
 | 2026-04-13 | MPS learn-only (sync) | 16,840 | +136% | learn() on MPS GPU, rollout on CPU. learn() -28%. |
-| 2026-04-13 | **async learn (CPU)** | **18,881** | **+165%** | **Double-buffered async learn in background thread. +33% over sync. New best.** |
+| 2026-04-13 | async learn (CPU) | 18,881 | +165% | Double-buffered async learn in background thread. +33% over sync. |
+| 2026-04-13 | **async + MPS learn** | **24,625** | **+246%** | **Async learn on MPS GPU + CPU inference network. learn() fully overlapped. New best.** |
 
 ### Previous experiments (128x128 network, archived)
 

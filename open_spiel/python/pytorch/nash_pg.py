@@ -254,8 +254,16 @@ class NashPGAgent:
                                 num_actions),
       ]
       self._write_buf = 0
-      # Point the main buffer attributes at buffer 0
       self._set_active_buffer(0)
+
+      # When async + learn_device, keep a CPU inference copy of the network.
+      # The main network moves to learn_device during learn(); the inference
+      # copy stays on CPU for step_raw().
+      if self._learn_device is not None:
+        self._inference_network = copy.deepcopy(self._network).to(self._device)
+        self._inference_network.eval()
+      else:
+        self._inference_network = None
 
     # Loss tracking
     self._last_pg_loss = None
@@ -359,9 +367,10 @@ class NashPGAgent:
     obs = torch.as_tensor(obs_np, device=self._device)
     mask = torch.as_tensor(mask_np, device=self._device)
 
+    # Use inference network if available (async + learn_device mode)
+    net = self._inference_network or self._network
     with torch.inference_mode():
-      action, logprob, _, value, _ = self._network.get_action_and_value(
-          obs, mask)
+      action, logprob, _, value, _ = net.get_action_and_value(obs, mask)
 
     self.obs[self.cur_batch_idx] = obs
     self.legal_actions_mask[self.cur_batch_idx] = mask
@@ -646,6 +655,10 @@ class NashPGAgent:
       # Move networks back to rollout device
       self._network.to(self._device)
       self._magnetic_network.to(self._device)
+
+    # Sync inference network (async + learn_device mode)
+    if self._inference_network is not None:
+      self._inference_network.load_state_dict(self._network.state_dict())
 
   def update_magnetic_reference(self):
     """Update the magnetic reference policy by cloning the current network."""

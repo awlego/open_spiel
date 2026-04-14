@@ -46,9 +46,11 @@ targeting learn() (PPO forward+backward passes) will have the highest impact.
 - **Notes**: Two rollout buffer sets, learn() runs in background thread while next rollout collects. On CPU, the GIL contention is noticeable (agent.step() inflated to 41%) but overall throughput improves because learn() is overlapped. Cannot combine with MPS learn_device due to network device race condition (see below).
 - **Implementation**: Added `async_learn` parameter and `--async_learn` flag. Double buffers swap each update.
 
-### 6. Async + MPS Learn
-- **Status**: BLOCKED - race condition
-- **Notes**: When async learn moves network to MPS in background thread, the main thread's step_raw() fails because it expects CPU network. Would need a shadow network copy or separate inference/training networks to fix. CPU async (+33%) is already a bigger win than sync MPS learn (+18.6%).
+### 6. Async + MPS Learn (with inference network)
+- **Status**: DONE - BEST RESULT (+73%)
+- **Result**: 14,196 → 24,625 steps/s (+73%)
+- **Notes**: Fixed race condition by adding a separate CPU inference network for step_raw(). Main network moves to MPS for learn(), inference network stays on CPU for rollout. Weights synced after each learn(). Combines the best of async overlap (no blocking) and MPS acceleration (faster PPO epochs). learn() appears as only 9.6% of time.
+- **Implementation**: Added _inference_network (CPU copy), step_raw uses it when available. _run_ppo_epochs syncs weights back after completion.
 
 ### 7. MPS for learn() Only (sync)
 - **Status**: DONE - SIGNIFICANT WIN (+18.6%)
