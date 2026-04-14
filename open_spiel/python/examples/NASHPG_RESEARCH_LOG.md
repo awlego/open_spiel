@@ -247,12 +247,25 @@ Priority reordered based on profiling. With async+MPS, the bottleneck is agent.s
   - Catches up by 1800s, exceeds by 5000 updates
 - **Notes**: LayerNorm adds ~12% inference overhead but improves final convergence quality. Worth it for long training runs (>5000 updates). The extra per-step cost could be reduced if the C++ BatchStepper eliminates the env bottleneck.
 
-### P. Entropy Schedule / Higher Entropy
-- **Expected impact**: POTENTIALLY POSITIVE for convergence quality
-- **Effort**: LOW
-- **Research finding**: For imperfect-info games, entropy coefficients of 0.05-0.2 are optimal (higher than single-agent PPO defaults of 0-0.01). Our current 0.05 is at the low end.
-- **Risk**: Dynamic decay schedules can hurt by suppressing early-turn exploration.
-- **To test**: entropy=0.1 for 3000+ updates, or entropy=0.1 + lr_decay combo.
+### P. Higher Entropy (0.1)
+- **Status**: DONE - SIGNIFICANTLY WORSE
+- **Result** (with lr5e4_decay): score=-18.8 (32.5% WR) at 5000 updates vs -6.6 (42.5% WR) with entropy=0.05. 
+- **Notes**: Despite research suggesting 0.05-0.2 for imperfect-info games, our magnetic regularization already provides sufficient exploration/regularization. Additional entropy prevents the policy from sharpening enough. entropy=0.05 confirmed as optimal.
+
+### S. Best Combo (lr5e4_decay + outer50 + LayerNorm)
+- **Status**: DONE - **NEW ABSOLUTE BEST**
+- **Result**: score=-5.0 (**45.1% WR**) at 5000 updates vs baseline -8.4 (42.0% WR)
+  - 3.1% WR improvement, 3.4 score improvement over baseline
+  - Wall-clock 1886s (+8% vs baseline due to LayerNorm overhead)
+  - Best update 4500: score=-4.8 (44.6% WR)
+- **Config**: `--learning_rate=5e-4 --lr_decay --outer_loop_every=50 --layer_norm`
+- **Why it works**: Higher LR for fast early convergence, decay for stability, frequent magnetic updates for exploration, LayerNorm for training stability
+
+### R. Outer Loop Frequency (outer_loop_every=50)
+- **Status**: DONE - HIGHER PEAKS BUT MORE OSCILLATION
+- **Result** (with lr5e4_decay): Peaks at **44.4% WR** at update 4500 (best WR ever!), but oscillates more. Score -5.2 at peak, then drops to -6.6 at 5000.
+- **Comparison**: lr5e4_decay with outer=100 is more stable (42.5% WR at 5000), outer=50 peaks higher but is less consistent.
+- **Notes**: Faster magnetic reference updates give more chances to find good strategies but cause instability. Best with "save best checkpoint" strategy.
 
 ### M. C++ BatchStepper (in pyspiel module)
 - **Status**: CODE WRITTEN, ABI ISSUE

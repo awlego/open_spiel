@@ -22,6 +22,11 @@ Usage:
   PYTHONPATH=. env3.12/bin/python open_spiel/python/examples/nash_pg_lost_cities_v2_pytorch.py \
     --use_raw --num_workers=6 --async_learn --learn_device=mps
 
+  # Best convergence (adds lr decay, LayerNorm, faster magnetic updates):
+  PYTHONPATH=. env3.12/bin/python open_spiel/python/examples/nash_pg_lost_cities_v2_pytorch.py \
+    --use_raw --num_workers=6 --async_learn --learn_device=mps --raw_worker \
+    --learning_rate=5e-4 --lr_decay --outer_loop_every=50 --layer_norm
+
   # Basic training (no acceleration)
   PYTHONPATH=. env3.12/bin/python open_spiel/python/examples/nash_pg_lost_cities_v2_pytorch.py
 
@@ -99,6 +104,12 @@ flags.DEFINE_string("learn_device", None,
                     "None = same as CPU.")
 flags.DEFINE_bool("async_learn", False,
                   "Enable async double-buffered learning.")
+flags.DEFINE_bool("lr_decay", False,
+                  "Linear LR decay to 10% of initial over total_updates.")
+flags.DEFINE_bool("layer_norm", False,
+                  "Use LayerNorm in actor and critic networks.")
+flags.DEFINE_bool("raw_worker", False,
+                  "Use raw pyspiel worker (bypass rl_environment wrapper).")
 flags.DEFINE_integer("seed", 42, "Random seed.")
 flags.DEFINE_string("logdir", "runs/lost_cities_nash_pg",
                     "TensorBoard log directory.")
@@ -374,6 +385,9 @@ def main(unused_argv):
         num_envs=FLAGS.num_envs,
         num_workers=FLAGS.num_workers,
         env_constructor=_make_env,
+        use_raw_worker=FLAGS.raw_worker,
+        game_name="lost_cities",
+        game_params={"enriched_obs": True},
     )
     logging.info("Using %d worker processes for %d environments.",
                  FLAGS.num_workers, FLAGS.num_envs)
@@ -419,6 +433,7 @@ def main(unused_argv):
       num_minibatches=FLAGS.num_minibatches,
       learn_device=FLAGS.learn_device,
       async_learn=FLAGS.async_learn,
+      use_layer_norm=FLAGS.layer_norm,
   )
 
   # Resume from checkpoint if available
@@ -446,6 +461,11 @@ def main(unused_argv):
   else:
     time_steps = envs.reset()
   for update in range(start_update, FLAGS.total_updates):
+    # Linear LR decay (to 10% of initial)
+    if FLAGS.lr_decay:
+      frac = 1.0 - 0.9 * update / FLAGS.total_updates
+      agent.set_learning_rate(FLAGS.learning_rate * frac)
+
     # Collect rollout
     if use_raw:
       for _ in range(FLAGS.num_steps):
