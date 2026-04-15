@@ -820,7 +820,7 @@ class NashPGAgent:
   def restore(self, checkpoint_dir):
     """Restore agent state from checkpoint directory."""
     path = os.path.join(checkpoint_dir, "nash_pg.pt")
-    data = torch.load(path, weights_only=True)
+    data = torch.load(path, weights_only=True, map_location=self._device)
     self._network.load_state_dict(data["network"])
     self._magnetic_network.load_state_dict(data["magnetic_network"])
     self._magnetic_network.eval()
@@ -829,4 +829,24 @@ class NashPGAgent:
     self._optimizer.load_state_dict(data["optimizer"])
     self.total_steps_done = data["total_steps_done"]
     self.updates_done = data["updates_done"]
+
+    # Ensure networks are on the rollout device.
+    self._network.to(self._device)
+    self._magnetic_network.to(self._device)
+
+    # Move optimizer state to learn_device so it matches where params will be
+    # during _run_ppo_epochs. Adam's internal buffers (exp_avg, exp_avg_sq)
+    # must be on the same device as the parameters when optimizer.step() runs.
+    if self._learn_device is not None:
+      for state in self._optimizer.state.values():
+        for k, v in state.items():
+          if isinstance(v, torch.Tensor):
+            state[k] = v.to(self._learn_device)
+
+    # Refresh inference network copy.
+    if self._inference_network is not None:
+      self._inference_network.load_state_dict(self._network.state_dict())
+      self._inference_network.to(self._device)
+      self._inference_network.eval()
+
     logging.info("Restored from %s", path)
