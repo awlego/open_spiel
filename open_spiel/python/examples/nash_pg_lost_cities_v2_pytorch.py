@@ -18,25 +18,20 @@ Uses a single shared agent with SyncVectorEnv for parallel self-play.
 Always uses enriched observations (enriched_obs=true, 517-dim tensor).
 
 Usage:
-  # Fast training (recommended: raw path + async learn on MPS GPU + 6 workers)
-  PYTHONPATH=. env3.12/bin/python open_spiel/python/examples/nash_pg_lost_cities_v2_pytorch.py \
-    --use_raw --num_workers=6 --async_learn --learn_device=mps
-
-  # Best convergence (adds lr decay, LayerNorm, faster magnetic updates):
-  PYTHONPATH=. env3.12/bin/python open_spiel/python/examples/nash_pg_lost_cities_v2_pytorch.py \
-    --use_raw --num_workers=6 --async_learn --learn_device=mps --raw_worker \
-    --learning_rate=5e-4 --lr_decay --outer_loop_every=50 --layer_norm
-
-  # Basic training (no acceleration)
+  # Recommended (C++ BatchStepper + async learn on MPS GPU, ~31k steps/s):
   PYTHONPATH=. env3.12/bin/python open_spiel/python/examples/nash_pg_lost_cities_v2_pytorch.py
+
+  # Resume from checkpoint:
+  PYTHONPATH=. env3.12/bin/python open_spiel/python/examples/nash_pg_lost_cities_v2_pytorch.py \
+    --checkpoint_dir=checkpoints/lost_cities_v4
+
+  # Basic training (no acceleration, ~2k steps/s):
+  PYTHONPATH=. env3.12/bin/python open_spiel/python/examples/nash_pg_lost_cities_v2_pytorch.py \
+    --nobatch_stepper --noasync_learn --learn_device="" --nolr_decay --nolayer_norm \
+    --learning_rate=3e-4 --num_steps=128 --outer_loop_every=100
 
 Monitor training:
   tensorboard --logdir=runs/lost_cities_nash_pg
-
-Resume from checkpoint:
-  PYTHONPATH=. env3.12/bin/python open_spiel/python/examples/nash_pg_lost_cities_v2_pytorch.py \
-    --use_raw --num_workers=6 --async_learn --learn_device=mps \
-    --checkpoint_dir=checkpoints/lost_cities_nash_pg
 """
 
 import json
@@ -63,7 +58,7 @@ FLAGS = flags.FLAGS
 
 flags.DEFINE_integer("num_envs", 64,
                      "Number of parallel environments.")
-flags.DEFINE_integer("num_steps", 128,
+flags.DEFINE_integer("num_steps", 256,
                      "Number of steps per rollout before learning.")
 flags.DEFINE_integer("total_updates", 10000,
                      "Total number of PPO update rounds.")
@@ -82,7 +77,7 @@ flags.DEFINE_list("actor_hidden_layers_sizes", None,
 flags.DEFINE_list("critic_hidden_layers_sizes", None,
                   "Hidden layer sizes for the critic network. "
                   "If not specified, uses --hidden_layers_sizes.")
-flags.DEFINE_float("learning_rate", 3e-4, "Learning rate for Adam optimizer.")
+flags.DEFINE_float("learning_rate", 5e-4, "Learning rate for Adam optimizer.")
 flags.DEFINE_float("entropy_cost", 0.05, "Entropy bonus coefficient.")
 flags.DEFINE_float("magnetic_cost", 0.2,
                    "Magnetic regularization coefficient.")
@@ -93,30 +88,32 @@ flags.DEFINE_float("gamma", 1.0, "Discount factor for GAE.")
 flags.DEFINE_float("gae_lambda", 0.95, "GAE lambda.")
 flags.DEFINE_integer("update_epochs", 4, "PPO epochs per batch.")
 flags.DEFINE_integer("num_minibatches", 4, "Minibatches per PPO epoch.")
-flags.DEFINE_integer("outer_loop_every", 100,
+flags.DEFINE_integer("outer_loop_every", 50,
                      "Updates between magnetic reference updates.")
 flags.DEFINE_integer("num_workers", 1,
                      "Number of worker processes for env simulation. "
                      "1 = synchronous (no subprocesses). Max 6.")
 flags.DEFINE_bool("use_raw", False,
                   "Use raw array step path (bypass TimeStep construction).")
-flags.DEFINE_string("learn_device", None,
+flags.DEFINE_string("learn_device", "mps",
                     "Torch device for learn() only (e.g. 'mps'). "
                     "None = same as CPU.")
-flags.DEFINE_bool("async_learn", False,
+flags.DEFINE_bool("async_learn", True,
                   "Enable async double-buffered learning.")
-flags.DEFINE_bool("lr_decay", False,
+flags.DEFINE_bool("lr_decay", True,
                   "Linear LR decay to 10% of initial over total_updates.")
-flags.DEFINE_bool("layer_norm", False,
+flags.DEFINE_bool("layer_norm", True,
                   "Use LayerNorm in actor and critic networks.")
 flags.DEFINE_bool("raw_worker", False,
                   "Use raw pyspiel worker (bypass rl_environment wrapper).")
-flags.DEFINE_bool("batch_stepper", False,
+flags.DEFINE_bool("batch_stepper", True,
                   "Use C++ BatchStepper (no subprocesses, single call stepping).")
+flags.DEFINE_integer("num_threads", 1,
+                     "PyTorch CPU threads. 1 avoids contention with async learn.")
 flags.DEFINE_integer("seed", 42, "Random seed.")
 flags.DEFINE_string("logdir", "runs/lost_cities_nash_pg",
                     "TensorBoard log directory.")
-flags.DEFINE_string("checkpoint_dir", "checkpoints/lost_cities_nash_pg",
+flags.DEFINE_string("checkpoint_dir", "checkpoints/lost_cities_v4",
                     "Directory for saving/resuming checkpoints.")
 flags.DEFINE_string("milestone_checkpoint", "",
                     "Path to a frozen model checkpoint for eval. "
@@ -379,6 +376,9 @@ def _make_env():
 
 
 def main(unused_argv):
+  if FLAGS.num_threads > 0:
+    torch.set_num_threads(FLAGS.num_threads)
+
   # Always use enriched observations (517-dim).
   if FLAGS.batch_stepper:
     FLAGS.use_raw = True  # BatchStepper only supports raw interface
