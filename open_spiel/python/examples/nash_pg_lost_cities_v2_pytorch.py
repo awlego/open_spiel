@@ -31,7 +31,7 @@ Usage:
     --learning_rate=3e-4 --num_steps=128 --outer_loop_every=100
 
 Monitor training:
-  tensorboard --logdir=runs/lost_cities_nash_pg
+  tensorboard --logdir=runs/v4_512x2_mc0.2_lr5e-4_ln_lrd
 """
 
 import json
@@ -60,8 +60,8 @@ flags.DEFINE_integer("num_envs", 64,
                      "Number of parallel environments.")
 flags.DEFINE_integer("num_steps", 256,
                      "Number of steps per rollout before learning.")
-flags.DEFINE_integer("total_updates", 10000,
-                     "Total number of PPO update rounds.")
+flags.DEFINE_integer("total_updates", 50000,
+                     "Total number of PPO update rounds (~26h at 31k steps/s).")
 flags.DEFINE_integer("eval_every", 50,
                      "Update frequency at which the agent is evaluated.")
 flags.DEFINE_integer("eval_games", 5000,
@@ -111,7 +111,7 @@ flags.DEFINE_bool("batch_stepper", True,
 flags.DEFINE_integer("num_threads", 1,
                      "PyTorch CPU threads. 1 avoids contention with async learn.")
 flags.DEFINE_integer("seed", 42, "Random seed.")
-flags.DEFINE_string("logdir", "runs/lost_cities_nash_pg",
+flags.DEFINE_string("logdir", "runs/v4_512x2_mc0.2_lr5e-4_ln_lrd",
                     "TensorBoard log directory.")
 flags.DEFINE_string("checkpoint_dir", "checkpoints/lost_cities_v4",
                     "Directory for saving/resuming checkpoints.")
