@@ -32,6 +32,9 @@ Usage:
 
 Monitor training:
   tensorboard --logdir=runs/v4_512x2_mc0.2_lr5e-4_ln_lrd
+
+Eval is decoupled — run the watcher in a separate terminal:
+  PYTHONPATH=. env3.12/bin/python open_spiel/python/examples/nash_pg_eval_watcher.py
 """
 
 import json
@@ -42,12 +45,10 @@ from absl import app
 from absl import flags
 from absl import logging
 
-import numpy as np
 import torch
 from torch.utils.tensorboard import SummaryWriter
 
 from open_spiel.python import rl_environment
-from open_spiel.python.bots import lost_cities_committer
 from open_spiel.python.pytorch import nash_pg
 from open_spiel.python.vector_env import BatchStepperEnv
 from open_spiel.python.vector_env import SubprocVectorEnv
@@ -62,10 +63,8 @@ flags.DEFINE_integer("num_steps", 256,
                      "Number of steps per rollout before learning.")
 flags.DEFINE_integer("total_updates", 50000,
                      "Total number of PPO update rounds (~26h at 31k steps/s).")
-flags.DEFINE_integer("eval_every", 50,
-                     "Update frequency at which the agent is evaluated.")
-flags.DEFINE_integer("eval_games", 5000,
-                     "Number of games per evaluation round.")
+flags.DEFINE_integer("log_every", 50,
+                     "Update frequency for logging losses and throughput.")
 flags.DEFINE_integer("checkpoint_every", 200,
                      "Update frequency at which checkpoints are saved.")
 flags.DEFINE_list("hidden_layers_sizes", [512, 512],
@@ -115,54 +114,16 @@ flags.DEFINE_string("logdir", "runs/v4_512x2_mc0.2_lr5e-4_ln_lrd",
                     "TensorBoard log directory.")
 flags.DEFINE_string("checkpoint_dir", "checkpoints/lost_cities_v4",
                     "Directory for saving/resuming checkpoints.")
-flags.DEFINE_string("milestone_checkpoint", "",
-                    "Path to a frozen model checkpoint for eval. "
-                    "If empty, skips model-vs-model evaluation.")
-
-
-class NashPGBot:
-  """Wraps a frozen NashPG checkpoint as a bot for evaluation.
-
-  Loads the actor network from a checkpoint directory and provides a
-  .step(state) interface compatible with _advance_non_agent().
-  """
-
-  def __init__(self, checkpoint_dir, player_id, info_state_size, num_actions):
-    self._player_id = player_id
-    self._info_state_size = info_state_size
-    self._num_actions = num_actions
-
-    # Load config to get architecture.
-    config_path = pathlib.Path(checkpoint_dir) / "config.json"
-    with open(config_path) as f:
-      config = json.load(f)
-
-    hidden = tuple(int(s) for s in config["hidden_layers_sizes"])
-    actor_sizes = (tuple(int(s) for s in config["actor_hidden_layers_sizes"])
-                   if config.get("actor_hidden_layers_sizes") else hidden)
-    critic_sizes = (tuple(int(s) for s in config["critic_hidden_layers_sizes"])
-                    if config.get("critic_hidden_layers_sizes") else hidden)
-
-    self._network = nash_pg.NashPGNetwork(
-        info_state_size, num_actions, actor_sizes, critic_sizes)
-    data = torch.load(
-        pathlib.Path(checkpoint_dir) / "nash_pg.pt", weights_only=True)
-    self._network.load_state_dict(data["network"])
-    self._network.eval()
-
-  def restart_at(self, state):
-    pass
-
-  def step(self, state):
-    obs = np.array(state.information_state_tensor(self._player_id),
-                   dtype=np.float32)
-    legal = state.legal_actions(self._player_id)
-    obs_t = torch.as_tensor(obs).unsqueeze(0)
-    mask = torch.zeros(1, self._num_actions, dtype=torch.bool)
-    mask[0, legal] = True
-    with torch.no_grad():
-      action, _, _, _, _ = self._network.get_action_and_value(obs_t, mask)
-    return action.item()
+flags.DEFINE_string("profile", "",
+                    "Enable torch.profiler and write Chrome trace to this path "
+                    "(e.g. 'trace.json'). Profiles a window of training updates "
+                    "including eval/checkpoint phases.")
+flags.DEFINE_integer("profile_start", -1,
+                     "Update number at which to start profiling. "
+                     "-1 = auto (start_update + 5, to skip warmup).")
+flags.DEFINE_integer("profile_updates", 20,
+                     "Number of updates to profile (should span at least one "
+                     "eval cycle to capture the full train+eval pattern).")
 
 
 def save_checkpoint(agent, checkpoint_dir, update, outer_step,
@@ -183,15 +144,6 @@ def save_checkpoint(agent, checkpoint_dir, update, outer_step,
 
   logging.info("Checkpoint saved at update %d (outer step %d) to %s",
                update, outer_step, ckpt_path)
-
-
-def save_best_checkpoint(agent, checkpoint_dir, update, outer_step,
-                         best_committer_wr):
-  """Save a copy of the agent to {checkpoint_dir}/best/."""
-  best_dir = str(pathlib.Path(checkpoint_dir) / "best")
-  save_checkpoint(agent, best_dir, update, outer_step, best_committer_wr)
-  logging.info("New best checkpoint! committer_wr=%.4f at update %d",
-               best_committer_wr, update)
 
 
 def load_checkpoint(agent, checkpoint_dir):
@@ -234,141 +186,6 @@ def load_checkpoint(agent, checkpoint_dir):
   logging.info("Resumed from checkpoint at update %d (outer step %d), "
                "best committer wr=%.4f", update, outer_step, best_committer_wr)
   return update, outer_step, best_committer_wr
-
-
-def _advance_non_agent(state, agent_player, rng, committer=None):
-  """Advance a game state past chance nodes and opponent turns.
-
-  Returns True if the state is still in progress (agent's turn next),
-  False if the game reached a terminal state.
-  """
-  while not state.is_terminal():
-    if state.is_chance_node():
-      outcomes = state.chance_outcomes()
-      action_list, prob_list = zip(*outcomes)
-      state.apply_action(rng.choice(action_list, p=prob_list))
-    elif state.current_player() != agent_player:
-      if committer is not None:
-        state.apply_action(committer.step(state))
-      else:
-        legal = state.legal_actions()
-        state.apply_action(rng.choice(legal))
-    else:
-      return True
-  return False
-
-
-def _run_vectorized_eval(game, agent, rng, num_games, batch_size=128,
-                         make_opponent=None):
-  """Run batched evaluation games.
-
-  Args:
-    game: pyspiel Game object.
-    agent: NashPGAgent with eval_step() method.
-    rng: numpy RandomState.
-    num_games: total games to play.
-    batch_size: max simultaneous games.
-    make_opponent: callable(player_id, rng) -> opponent bot, or None for random.
-
-  Returns:
-    (wins, avg_return) for the agent.
-  """
-  wins = 0
-  total_return = 0.0
-  games_completed = 0
-  next_game = 0
-
-  batch = min(batch_size, num_games)
-  states = [None] * batch
-  agent_players = [0] * batch
-  opponents = [None] * batch
-
-  # Start initial batch of games
-  for i in range(batch):
-    agent_players[i] = next_game % 2
-    states[i] = game.new_initial_state()
-    if make_opponent is not None:
-      opponents[i] = make_opponent(1 - agent_players[i], rng)
-      opponents[i].restart_at(states[i])
-    _advance_non_agent(states[i], agent_players[i], rng, opponents[i])
-    next_game += 1
-
-  while games_completed < num_games:
-    # Collect indices where the agent needs to act (non-terminal states)
-    agent_indices = []
-    agent_ts = []
-    for i in range(batch):
-      if states[i] is None:
-        continue
-      if states[i].is_terminal():
-        # Record result and recycle slot
-        returns = states[i].returns()
-        total_return += returns[agent_players[i]]
-        if returns[agent_players[i]] > 0:
-          wins += 1
-        games_completed += 1
-
-        if next_game < num_games:
-          agent_players[i] = next_game % 2
-          states[i] = game.new_initial_state()
-          if make_opponent is not None:
-            opponents[i] = make_opponent(1 - agent_players[i], rng)
-            opponents[i].restart_at(states[i])
-          next_game += 1
-          # Advance past chance/opponent to agent's turn or terminal
-          _advance_non_agent(states[i], agent_players[i], rng, opponents[i])
-          # Re-check: might already be terminal after advancing
-          if states[i].is_terminal():
-            continue
-        else:
-          states[i] = None
-          continue
-
-      ap = agent_players[i]
-      obs = {
-          "info_state": [None, None],
-          "legal_actions": [None, None],
-          "current_player": ap,
-      }
-      obs["info_state"][ap] = states[i].information_state_tensor(ap)
-      obs["legal_actions"][ap] = states[i].legal_actions(ap)
-      agent_indices.append(i)
-      agent_ts.append(rl_environment.TimeStep(
-          observations=obs, rewards=None, discounts=None, step_type=None))
-
-    if not agent_ts:
-      continue
-
-    # Batched inference
-    actions = agent.eval_step(agent_ts)
-    for idx, action in zip(agent_indices, actions):
-      states[idx].apply_action(action)
-      # Advance past chance/opponent until agent's turn again or terminal
-      _advance_non_agent(states[idx], agent_players[idx], rng, opponents[idx])
-
-  return wins, total_return / num_games
-
-
-def eval_vs_random(game, agent, rng, num_games, device="cpu"):
-  """Evaluate the agent vs a random opponent, alternating player seats."""
-  return _run_vectorized_eval(game, agent, rng, num_games)
-
-
-def eval_vs_committer(game, agent, rng, num_games, device="cpu"):
-  """Evaluate the agent vs CommitterBot, alternating player seats."""
-  def make_committer(player_id, rng):
-    return lost_cities_committer.LostCitiesCommitterBot(player_id, rng)
-  return _run_vectorized_eval(game, agent, rng, num_games,
-                              make_opponent=make_committer)
-
-
-def eval_vs_model(game, agent, rng, num_games, checkpoint_dir,
-                  info_state_size, num_actions):
-  """Evaluate the agent vs a frozen NashPG model checkpoint."""
-  def make_model_bot(player_id, rng):
-    return NashPGBot(checkpoint_dir, player_id, info_state_size, num_actions)
-  return _run_vectorized_eval(game, agent, rng, num_games,
-                              make_opponent=make_model_bot)
 
 
 def _make_env():
@@ -449,21 +266,24 @@ def main(unused_argv):
   )
 
   # Resume from checkpoint if available
-  start_update, outer_step, best_committer_wr = load_checkpoint(
-      agent, FLAGS.checkpoint_dir)
+  start_update, outer_step, _ = load_checkpoint(agent, FLAGS.checkpoint_dir)
 
   writer = SummaryWriter(FLAGS.logdir)
-  eval_rng = np.random.RandomState(FLAGS.seed + 1)
-  if hasattr(envs, 'envs'):
-    game = envs.envs[0]._game  # pylint: disable=protected-access
-  else:
-    _tmp = _make_env()
-    game = _tmp._game  # pylint: disable=protected-access
-    del _tmp
 
   remaining = FLAGS.total_updates - start_update
   logging.info("Training updates %d to %d (%d remaining)...",
                start_update + 1, FLAGS.total_updates, remaining)
+
+  # Profiler setup
+  profiler = None
+  if FLAGS.profile:
+    if FLAGS.profile_start < 0:
+      FLAGS.profile_start = start_update + 5
+    profile_end = FLAGS.profile_start + FLAGS.profile_updates
+    logging.info("Profiling updates %d-%d, will write to %s",
+                 FLAGS.profile_start, profile_end - 1, FLAGS.profile)
+  else:
+    profile_end = -1
 
   t_start = time.time()
 
@@ -473,89 +293,74 @@ def main(unused_argv):
   else:
     time_steps = envs.reset()
   for update in range(start_update, FLAGS.total_updates):
+    # Start profiler at the right update
+    if FLAGS.profile and update == FLAGS.profile_start and profiler is None:
+      agent._bg_trace_events = []  # Reset so we only capture the window
+      profiler = torch.profiler.profile(
+          activities=[torch.profiler.ProfilerActivity.CPU],
+          record_shapes=False,
+          with_stack=False,
+          schedule=torch.profiler.schedule(
+              wait=0, warmup=0,
+              active=FLAGS.profile_updates, repeat=1),
+      )
+      profiler.start()
+      logging.info("Profiler started at update %d", update)
+
     # Linear LR decay (to 10% of initial)
     if FLAGS.lr_decay:
       frac = 1.0 - 0.9 * update / FLAGS.total_updates
       agent.set_learning_rate(FLAGS.learning_rate * frac)
 
     # Collect rollout
-    if use_raw:
-      for _ in range(FLAGS.num_steps):
-        actions = agent.step_raw(obs, mask, players)
-        obs, mask, players, rewards, dones = envs.step_raw(
-            actions, reset_if_done=True)
-        agent.post_step_raw(rewards, dones, players)
-      agent.learn_raw(obs, players)
-    else:
-      for _ in range(FLAGS.num_steps):
-        agent_output = agent.step(time_steps)
-        time_steps, rewards, dones, unreset_ts = envs.step(
-            agent_output, reset_if_done=True)
-        agent.post_step(rewards, dones)
-      agent.learn(time_steps)
+    with torch.profiler.record_function(f"rollout_{update}"):
+      if use_raw:
+        for _ in range(FLAGS.num_steps):
+          with torch.profiler.record_function("agent.step_raw"):
+            actions = agent.step_raw(obs, mask, players)
+          with torch.profiler.record_function("env.step_raw"):
+            obs, mask, players, rewards, dones = envs.step_raw(
+                actions, reset_if_done=True)
+          with torch.profiler.record_function("post_step_raw"):
+            agent.post_step_raw(rewards, dones, players)
+      else:
+        for _ in range(FLAGS.num_steps):
+          with torch.profiler.record_function("agent.step"):
+            agent_output = agent.step(time_steps)
+          with torch.profiler.record_function("env.step"):
+            time_steps, rewards, dones, unreset_ts = envs.step(
+                agent_output, reset_if_done=True)
+          with torch.profiler.record_function("post_step"):
+            agent.post_step(rewards, dones)
+
+    with torch.profiler.record_function("learn"):
+      if use_raw:
+        agent.learn_raw(obs, players)
+      else:
+        agent.learn(time_steps)
 
     # Outer loop: update magnetic reference
     if (update + 1) % FLAGS.outer_loop_every == 0:
-      if hasattr(agent, '_wait_for_learn'):
-        agent._wait_for_learn()
-      agent.update_magnetic_reference()
+      with torch.profiler.record_function("wait_for_learn"):
+        if hasattr(agent, '_wait_for_learn'):
+          agent._wait_for_learn()
+      with torch.profiler.record_function("magnetic_update"):
+        agent.update_magnetic_reference()
       outer_step += 1
       writer.add_scalar("nash_pg/outer_step", outer_step,
                          agent.total_steps_done)
       logging.info("Outer loop step %d at update %d", outer_step, update + 1)
 
-    # Evaluate periodically
-    if (update + 1) % FLAGS.eval_every == 0:
-      if hasattr(agent, '_wait_for_learn'):
-        agent._wait_for_learn()
+    # Log losses and throughput periodically
+    if (update + 1) % FLAGS.log_every == 0:
       elapsed = time.time() - t_start
       steps_per_sec = agent.total_steps_done / elapsed
 
-      # Log losses
       pg_loss, v_loss, mag_loss, ent = agent.loss
       writer.add_scalar("loss/policy", pg_loss or 0, agent.total_steps_done)
       writer.add_scalar("loss/value", v_loss or 0, agent.total_steps_done)
       writer.add_scalar("loss/magnetic", mag_loss or 0, agent.total_steps_done)
       writer.add_scalar("loss/entropy", ent or 0, agent.total_steps_done)
-
-      # Evaluate vs random
-      wins, avg_score = eval_vs_random(
-          game, agent, eval_rng, FLAGS.eval_games)
-      win_rate = wins / FLAGS.eval_games
-
-      writer.add_scalar("eval/win_rate_vs_random", win_rate,
-                         agent.total_steps_done)
-      writer.add_scalar("eval/avg_score_vs_random", avg_score,
-                         agent.total_steps_done)
-
-      # Evaluate vs committer
-      c_wins, c_avg_score = eval_vs_committer(
-          game, agent, eval_rng, FLAGS.eval_games)
-      c_win_rate = c_wins / FLAGS.eval_games
-      writer.add_scalar("eval/win_rate_vs_committer", c_win_rate,
-                         agent.total_steps_done)
-      writer.add_scalar("eval/avg_score_vs_committer", c_avg_score,
-                         agent.total_steps_done)
-
-      # Save best checkpoint if committer win rate improved
-      if c_win_rate > best_committer_wr:
-        best_committer_wr = c_win_rate
-        save_best_checkpoint(agent, FLAGS.checkpoint_dir, update + 1,
-                             outer_step, best_committer_wr)
-
-      # Evaluate vs milestone model (if configured)
-      m_wr_str = ""
-      if FLAGS.milestone_checkpoint:
-        m_wins, m_avg_score = eval_vs_model(
-            game, agent, eval_rng, FLAGS.eval_games,
-            FLAGS.milestone_checkpoint, info_state_size, num_actions)
-        m_win_rate = m_wins / FLAGS.eval_games
-        writer.add_scalar("eval/win_rate_vs_milestone", m_win_rate,
-                           agent.total_steps_done)
-        writer.add_scalar("eval/avg_score_vs_milestone", m_avg_score,
-                           agent.total_steps_done)
-        m_wr_str = f" vs_mile=%.2f/%.1f" % (m_win_rate, m_avg_score)
-
       writer.add_scalar("perf/steps_per_sec", steps_per_sec,
                          agent.total_steps_done)
 
@@ -565,50 +370,35 @@ def main(unused_argv):
                    ) / 3600 if steps_per_sec > 0 else 0
 
       logging.info(
-          "Update %d | steps=%d | vs_rand=%.2f/%.1f vs_commit=%.2f/%.1f%s | "
-          "%.0f steps/s | ETA %.1fh | outer_step=%d",
-          update + 1, agent.total_steps_done, win_rate, avg_score,
-          c_win_rate, c_avg_score, m_wr_str, steps_per_sec, eta_hours,
+          "Update %d | steps=%d | %.0f steps/s | ETA %.1fh | outer_step=%d",
+          update + 1, agent.total_steps_done, steps_per_sec, eta_hours,
           outer_step)
 
     # Save checkpoints periodically
     if (update + 1) % FLAGS.checkpoint_every == 0:
-      if hasattr(agent, '_wait_for_learn'):
-        agent._wait_for_learn()
-      save_checkpoint(agent, FLAGS.checkpoint_dir, update + 1, outer_step,
-                      best_committer_wr)
+      with torch.profiler.record_function("wait_for_learn"):
+        if hasattr(agent, '_wait_for_learn'):
+          agent._wait_for_learn()
+      with torch.profiler.record_function("checkpoint"):
+        save_checkpoint(agent, FLAGS.checkpoint_dir, update + 1, outer_step)
 
-  # Final checkpoint and evaluation
+    # Step and export profiler
+    if profiler is not None:
+      profiler.step()
+      if update + 1 >= profile_end:
+        if hasattr(agent, '_wait_for_learn'):
+          agent._wait_for_learn()
+        profiler.stop()
+        profiler.export_chrome_trace(FLAGS.profile)
+        agent.inject_bg_trace_events(FLAGS.profile)
+        logging.info("Chrome trace written to %s (updates %d-%d)",
+                     FLAGS.profile, FLAGS.profile_start, update)
+        profiler = None
+
+  # Final checkpoint
   if hasattr(agent, '_wait_for_learn'):
     agent._wait_for_learn()
-  save_checkpoint(agent, FLAGS.checkpoint_dir, FLAGS.total_updates, outer_step,
-                  best_committer_wr)
-
-  wins, avg_score = eval_vs_random(game, agent, eval_rng, FLAGS.eval_games)
-  c_wins, c_avg_score = eval_vs_committer(
-      game, agent, eval_rng, FLAGS.eval_games)
-  logging.info("Final: %d/%d wins vs random (avg %.1f), "
-               "%d/%d wins vs committer (avg %.1f)",
-               wins, FLAGS.eval_games, avg_score,
-               c_wins, FLAGS.eval_games, c_avg_score)
-  writer.add_scalar("eval/win_rate_vs_random",
-                     wins / FLAGS.eval_games, agent.total_steps_done)
-  writer.add_scalar("eval/avg_score_vs_random",
-                     avg_score, agent.total_steps_done)
-  writer.add_scalar("eval/win_rate_vs_committer",
-                     c_wins / FLAGS.eval_games, agent.total_steps_done)
-  writer.add_scalar("eval/avg_score_vs_committer",
-                     c_avg_score, agent.total_steps_done)
-  if FLAGS.milestone_checkpoint:
-    m_wins, m_avg_score = eval_vs_model(
-        game, agent, eval_rng, FLAGS.eval_games,
-        FLAGS.milestone_checkpoint, info_state_size, num_actions)
-    logging.info("Final: %d/%d wins vs milestone (avg %.1f)",
-                 m_wins, FLAGS.eval_games, m_avg_score)
-    writer.add_scalar("eval/win_rate_vs_milestone",
-                       m_wins / FLAGS.eval_games, agent.total_steps_done)
-    writer.add_scalar("eval/avg_score_vs_milestone",
-                       m_avg_score, agent.total_steps_done)
+  save_checkpoint(agent, FLAGS.checkpoint_dir, FLAGS.total_updates, outer_step)
 
   writer.close()
   if hasattr(envs, "close"):
