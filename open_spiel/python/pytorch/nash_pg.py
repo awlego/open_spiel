@@ -807,6 +807,7 @@ class NashPGAgent:
   def save(self, checkpoint_dir):
     """Save agent state to checkpoint directory."""
     path = os.path.join(checkpoint_dir, "nash_pg.pt")
+    tmp_path = path + ".tmp"
     data = {
         "network": self._network.state_dict(),
         "magnetic_network": self._magnetic_network.state_dict(),
@@ -814,7 +815,10 @@ class NashPGAgent:
         "total_steps_done": self.total_steps_done,
         "updates_done": self.updates_done,
     }
-    torch.save(data, path)
+    # Atomic save: write to tmp, then rename. Prevents readers (e.g. eval
+    # watcher) from seeing a half-written zip archive mid-save.
+    torch.save(data, tmp_path)
+    os.replace(tmp_path, path)
     logging.info("Saved to %s", path)
 
   def restore(self, checkpoint_dir):

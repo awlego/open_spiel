@@ -25,12 +25,12 @@ Usage:
 
   # Custom dirs:
   PYTHONPATH=. env3.12/bin/python open_spiel/python/examples/nash_pg_eval_watcher.py \
-    --checkpoint_dir=checkpoints/lost_cities_v4 \
-    --logdir=runs/v4_512x2_mc0.2_lr5e-4_ln_lrd
+    --checkpoint_dir=checkpoints/lost_cities_v5 \
+    --logdir=runs/v5_512x2_mc0.2_lr5e-4_ln_lrd
 
   # Also evaluate against a frozen milestone model:
   PYTHONPATH=. env3.12/bin/python open_spiel/python/examples/nash_pg_eval_watcher.py \
-    --milestone_checkpoint=checkpoints/lost_cities_v4/best
+    --milestone_checkpoint=checkpoints/lost_cities_v5/best
 """
 
 import json
@@ -52,9 +52,9 @@ from open_spiel.python.pytorch import nash_pg
 
 FLAGS = flags.FLAGS
 
-flags.DEFINE_string("checkpoint_dir", "checkpoints/lost_cities_v4",
+flags.DEFINE_string("checkpoint_dir", "checkpoints/lost_cities_v5",
                     "Checkpoint directory to watch.")
-flags.DEFINE_string("logdir", "runs/v4_512x2_mc0.2_lr5e-4_ln_lrd",
+flags.DEFINE_string("logdir", "runs/v5_512x2_mc0.2_lr5e-4_ln_lrd",
                     "TensorBoard log directory (should match training).")
 flags.DEFINE_integer("eval_games", 5000,
                      "Number of games per evaluation matchup.")
@@ -87,7 +87,8 @@ class NashPGBot:
                     if config.get("critic_hidden_layers_sizes") else hidden)
 
     self._network = nash_pg.NashPGNetwork(
-        info_state_size, num_actions, actor_sizes, critic_sizes)
+        info_state_size, num_actions, actor_sizes, critic_sizes,
+        use_layer_norm=config.get("layer_norm", False))
     data = torch.load(
         pathlib.Path(checkpoint_dir) / "nash_pg.pt", weights_only=True)
     self._network.load_state_dict(data["network"])
@@ -202,12 +203,40 @@ def _run_vectorized_eval(game, agent, rng, num_games, batch_size=128,
   return wins, total_return / num_games
 
 
+def _retry_torch_load(path, **kwargs):
+  """torch.load with retry, for races where training is mid-save.
+
+  Training now writes atomically (tmp + rename), so this is mostly defensive,
+  but it also covers old training processes still running with the previous
+  non-atomic save path.
+  """
+  last_err = None
+  for attempt in range(5):
+    try:
+      return torch.load(path, **kwargs)
+    except (RuntimeError, EOFError, json.JSONDecodeError) as err:
+      last_err = err
+      time.sleep(0.5 * (attempt + 1))
+  raise last_err
+
+
+def _retry_json_load(path):
+  last_err = None
+  for attempt in range(5):
+    try:
+      with open(path) as f:
+        return json.load(f)
+    except (json.JSONDecodeError, OSError) as err:
+      last_err = err
+      time.sleep(0.5 * (attempt + 1))
+  raise last_err
+
+
 def load_agent_from_checkpoint(checkpoint_dir):
   """Load a NashPGAgent from a checkpoint for eval only."""
   ckpt_path = pathlib.Path(checkpoint_dir)
   config_path = ckpt_path / "config.json"
-  with open(config_path) as f:
-    config = json.load(f)
+  config = _retry_json_load(config_path)
 
   # Get game info
   env = rl_environment.Environment("lost_cities", enriched_obs=True)
@@ -300,7 +329,18 @@ def main(unused_argv):
   del env
 
   last_evaluated_update = -1
-  best_committer_wr = 0.0
+
+  # The watcher owns best_committer_wr — initialize from best/meta.pt so we
+  # don't overwrite a previously-saved best when restarting.
+  best_dir = ckpt_path / "best"
+  best_meta_file = best_dir / "meta.pt"
+  if best_meta_file.exists():
+    best_meta = torch.load(best_meta_file, weights_only=True)
+    best_committer_wr = best_meta.get("best_committer_wr", 0.0)
+    logging.info("Loaded existing best checkpoint: committer_wr=%.4f at update %d",
+                 best_committer_wr, best_meta.get("update", 0))
+  else:
+    best_committer_wr = 0.0
 
   logging.info("Watching %s for new checkpoints (poll every %ds)...",
                ckpt_path, FLAGS.poll_interval)
@@ -313,14 +353,28 @@ def main(unused_argv):
       else:
         break
 
-    meta = torch.load(meta_file, weights_only=True)
+    try:
+      meta = _retry_torch_load(meta_file, weights_only=True)
+    except Exception as err:  # pylint: disable=broad-except
+      logging.warning("meta.pt read failed after retries (%s); will retry "
+                      "next poll.", err)
+      time.sleep(FLAGS.poll_interval)
+      continue
     current_update = meta["update"]
-    best_committer_wr = meta.get("best_committer_wr", best_committer_wr)
 
     if current_update > last_evaluated_update:
       logging.info("New checkpoint at update %d, loading...", current_update)
 
-      agent, _, _, _ = load_agent_from_checkpoint(FLAGS.checkpoint_dir)
+      try:
+        agent, _, _, _ = load_agent_from_checkpoint(FLAGS.checkpoint_dir)
+      except RuntimeError as err:
+        # Zip corruption from a race against training's save. With atomic
+        # saves this shouldn't happen, but log and wait for the next poll so
+        # a single bad read doesn't crash the watcher.
+        logging.warning("Checkpoint load failed (%s); will retry next poll.",
+                        err)
+        time.sleep(FLAGS.poll_interval)
+        continue
       total_steps = agent.total_steps_done
 
       c_wr = run_eval(FLAGS.checkpoint_dir, writer, rng, game, agent,
@@ -330,7 +384,6 @@ def main(unused_argv):
       # Save best checkpoint if committer win rate improved
       if c_wr > best_committer_wr:
         best_committer_wr = c_wr
-        best_dir = ckpt_path / "best"
         best_dir.mkdir(parents=True, exist_ok=True)
         # Copy current checkpoint to best/
         import shutil

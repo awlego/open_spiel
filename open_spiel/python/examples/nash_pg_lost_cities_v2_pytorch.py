@@ -23,7 +23,7 @@ Usage:
 
   # Resume from checkpoint:
   PYTHONPATH=. env3.12/bin/python open_spiel/python/examples/nash_pg_lost_cities_v2_pytorch.py \
-    --checkpoint_dir=checkpoints/lost_cities_v4
+    --checkpoint_dir=checkpoints/lost_cities_v5
 
   # Basic training (no acceleration, ~2k steps/s):
   PYTHONPATH=. env3.12/bin/python open_spiel/python/examples/nash_pg_lost_cities_v2_pytorch.py \
@@ -31,13 +31,14 @@ Usage:
     --learning_rate=3e-4 --num_steps=128 --outer_loop_every=100
 
 Monitor training:
-  tensorboard --logdir=runs/v4_512x2_mc0.2_lr5e-4_ln_lrd
+  tensorboard --logdir=runs/v5_512x2_mc0.2_lr5e-4_ln_lrd
 
 Eval is decoupled — run the watcher in a separate terminal:
   PYTHONPATH=. env3.12/bin/python open_spiel/python/examples/nash_pg_eval_watcher.py
 """
 
 import json
+import os
 import pathlib
 import time
 
@@ -61,8 +62,8 @@ flags.DEFINE_integer("num_envs", 64,
                      "Number of parallel environments.")
 flags.DEFINE_integer("num_steps", 256,
                      "Number of steps per rollout before learning.")
-flags.DEFINE_integer("total_updates", 50000,
-                     "Total number of PPO update rounds (~26h at 31k steps/s).")
+flags.DEFINE_integer("total_updates", 1000000,
+                     "Total number of PPO update rounds.")
 flags.DEFINE_integer("log_every", 50,
                      "Update frequency for logging losses and throughput.")
 flags.DEFINE_integer("checkpoint_every", 200,
@@ -110,9 +111,9 @@ flags.DEFINE_bool("batch_stepper", True,
 flags.DEFINE_integer("num_threads", 1,
                      "PyTorch CPU threads. 1 avoids contention with async learn.")
 flags.DEFINE_integer("seed", 42, "Random seed.")
-flags.DEFINE_string("logdir", "runs/v4_512x2_mc0.2_lr5e-4_ln_lrd",
+flags.DEFINE_string("logdir", "runs/v5_512x2_mc0.2_lr5e-4_ln_lrd",
                     "TensorBoard log directory.")
-flags.DEFINE_string("checkpoint_dir", "checkpoints/lost_cities_v4",
+flags.DEFINE_string("checkpoint_dir", "checkpoints/lost_cities_v5",
                     "Directory for saving/resuming checkpoints.")
 flags.DEFINE_string("profile", "",
                     "Enable torch.profiler and write Chrome trace to this path "
@@ -126,21 +127,31 @@ flags.DEFINE_integer("profile_updates", 20,
                      "eval cycle to capture the full train+eval pattern).")
 
 
-def save_checkpoint(agent, checkpoint_dir, update, outer_step,
-                    best_committer_wr=0.0):
-  """Save agent networks, training state, and hyperparameter config."""
+def save_checkpoint(agent, checkpoint_dir, update, outer_step):
+  """Save agent networks, training state, and hyperparameter config.
+
+  best_committer_wr is owned by the eval watcher and lives in best/meta.pt.
+
+  All files are written atomically (tmp + rename) so the eval watcher never
+  observes a half-written file.
+  """
   ckpt_path = pathlib.Path(checkpoint_dir)
   ckpt_path.mkdir(parents=True, exist_ok=True)
 
   agent.save(str(ckpt_path))
 
-  meta = {"update": update, "outer_step": outer_step,
-          "best_committer_wr": best_committer_wr}
-  torch.save(meta, ckpt_path / "meta.pt")
+  meta_path = ckpt_path / "meta.pt"
+  meta_tmp = ckpt_path / "meta.pt.tmp"
+  meta = {"update": update, "outer_step": outer_step}
+  torch.save(meta, meta_tmp)
+  os.replace(meta_tmp, meta_path)
 
+  config_path = ckpt_path / "config.json"
+  config_tmp = ckpt_path / "config.json.tmp"
   config = FLAGS.flag_values_dict()
-  with open(ckpt_path / "config.json", "w") as f:
+  with open(config_tmp, "w") as f:
     json.dump(config, f, indent=2, default=str)
+  os.replace(config_tmp, config_path)
 
   logging.info("Checkpoint saved at update %d (outer step %d) to %s",
                update, outer_step, ckpt_path)
@@ -155,7 +166,7 @@ def load_checkpoint(agent, checkpoint_dir):
   ckpt_path = pathlib.Path(checkpoint_dir)
   meta_file = ckpt_path / "meta.pt"
   if not meta_file.exists():
-    return 0, 0, 0.0
+    return 0, 0
 
   meta = torch.load(meta_file, weights_only=True)
   agent.restore(str(ckpt_path))
@@ -182,10 +193,9 @@ def load_checkpoint(agent, checkpoint_dir):
 
   update = meta["update"]
   outer_step = meta.get("outer_step", 0)
-  best_committer_wr = meta.get("best_committer_wr", 0.0)
-  logging.info("Resumed from checkpoint at update %d (outer step %d), "
-               "best committer wr=%.4f", update, outer_step, best_committer_wr)
-  return update, outer_step, best_committer_wr
+  logging.info("Resumed from checkpoint at update %d (outer step %d)",
+               update, outer_step)
+  return update, outer_step
 
 
 def _make_env():
@@ -266,7 +276,7 @@ def main(unused_argv):
   )
 
   # Resume from checkpoint if available
-  start_update, outer_step, _ = load_checkpoint(agent, FLAGS.checkpoint_dir)
+  start_update, outer_step = load_checkpoint(agent, FLAGS.checkpoint_dir)
 
   writer = SummaryWriter(FLAGS.logdir)
 
