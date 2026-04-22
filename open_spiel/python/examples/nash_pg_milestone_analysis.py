@@ -50,9 +50,9 @@ from open_spiel.python.pytorch import nash_pg
 
 FLAGS = flags.FLAGS
 
-flags.DEFINE_string("milestone_apr16", "checkpoints/lost_cities_v5/milestone_apr16",
+flags.DEFINE_string("milestone_apr16", "checkpoints/lost_cities_v5/best",
                     "Path to first milestone checkpoint.")
-flags.DEFINE_string("milestone_apr20", "checkpoints/lost_cities_v5/milestone_apr20_u653800",
+flags.DEFINE_string("milestone_apr20", "checkpoints/lost_cities_v5",
                     "Path to second milestone checkpoint.")
 flags.DEFINE_integer("num_games", 300,
                      "Games per pairing (split evenly across seat swap).")
@@ -533,8 +533,20 @@ def main(unused_argv):
   def mk_apr20(pid, _rng):
     return preloaded[("apr20", pid)]
 
-  NAME_APR16 = "milestone_apr16 (u66000)"
-  NAME_APR20 = "milestone_apr20 (u653800)"
+  def _ckpt_label(path, fallback):
+    try:
+      meta = torch.load(pathlib.Path(path) / "meta.pt", weights_only=False)
+      u = meta.get("update")
+      wr = meta.get("best_committer_wr")
+      tag = f"u{u}" if u is not None else fallback
+      if wr is not None:
+        tag += f" wr={wr:.3f}"
+      return f"{pathlib.Path(path).name} ({tag})"
+    except Exception:
+      return f"{pathlib.Path(path).name} ({fallback})"
+
+  NAME_APR16 = _ckpt_label(FLAGS.milestone_apr16, "ckpt_a")
+  NAME_APR20 = _ckpt_label(FLAGS.milestone_apr20, "ckpt_b")
   NAME_COMM = "committer"
 
   cross_stats = {NAME_APR16: _empty_stats(),
